@@ -1,0 +1,10 @@
+The fonts in Assets/Resources/Fonts are from Google Fonts and are licensed under
+the SIL Open Font License, Version 1.1 (https://openfontlicense.org). Each font's
+copyright notice is inside the font file.
+
+  Outfit           Daylight headings              Copyright The Outfit Project Authors
+  DM Sans          Daylight text                  Copyright The DM Sans Project Authors
+  Plus Jakarta     Soft night (all text)          Copyright The Plus Jakarta Sans Project Authors
+  Oxanium          Holo HUD headings              Copyright The Oxanium Project Authors
+  Manrope          Holo HUD text                  Copyright The Manrope Project Authors
+  Martian Mono     Holo HUD labels and codes      Copyright The Martian Mono Project Authors

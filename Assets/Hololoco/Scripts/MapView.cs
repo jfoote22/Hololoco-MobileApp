@@ -1,7 +1,8 @@
-// The home screen's map: a tilted, dark Mapbox map of the streets around the
-// player, with 3D buildings, the player's avatar and pulsing hexagon rings, and a
-// gem for each nearby drop. Drag to pan, pinch to zoom, twist to rotate; tap a gem
-// to select it. Everything here is on the map layer, seen only by the map camera.
+// The home screen's map: a tilted Mapbox map of the streets around the player,
+// coloured by the skin, with 3D buildings, the player's avatar and a pulsing ring.
+// Drops are shown by the app as pins over the map (ScreenOf says where). One finger
+// orbits, two fingers pan and pinch. Everything here is on the map layer, seen only
+// by the map camera.
 //
 // Coordinates: metres east (x) and north (z) of an origin near the player, from
 // Web Mercator scaled by cos(latitude), which is accurate over a few kilometres.
@@ -20,16 +21,17 @@ namespace Hololoco
         public const int Layer = 8;
         const int Zoom = 16;
         const double EarthRadius = 6378137.0;
-        /// <summary>Mapbox's classic look by default; the dark "game map" when switched on.</summary>
+        /// <summary>Mapbox's classic look for light skins; the dark navigation map for dark ones.</summary>
         const string LightStyle = "mapbox/streets-v12", DarkStyle = "mapbox/navigation-night-v1";
         public bool GameMap { get; private set; }
+        Color ringColour = new(0f, 0.47f, 0.54f);
+        Gem avatarGem;
         string Style => GameMap ? DarkStyle : LightStyle;
 
         public Camera Camera;
         public bool ShowBuildings = true;
         /// <summary>Set by the app: whether a screen point is over its interface.</summary>
         public Func<Vector2, bool> IsOverUi = _ => false;
-        public event Action<DropInfo> Tapped;
 
         // Camera
         public float Distance = 320f;
@@ -51,7 +53,7 @@ namespace Hololoco
         readonly List<Transform> rings = new();
         readonly Dictionary<(int, int), GameObject> ground = new();
         readonly Dictionary<(int, int), GameObject> buildings = new();
-        readonly Dictionary<string, (Gem gem, DropInfo drop)> gems = new();
+        readonly Dictionary<string, DropInfo> drops = new();
         LineRenderer route;
         (int, int) centreTile = (-1, -1);
 
@@ -135,32 +137,26 @@ namespace Hololoco
             centreTile = (-1, -1);
             hasPlayer = false;
             SetPlayer(lat, lng, headingTarget);
-            foreach (var (gem, drop) in gems.Values) gem.transform.position = World(drop.Lat, drop.Lng);
             SetRoute(null);
         }
 
-        public void ShowDrops(IList<DropInfo> drops)
+        /// <summary>The drops the app shows as pins.</summary>
+        public void ShowDrops(IList<DropInfo> list)
         {
-            if (!hasOrigin) return;
-            var keep = new HashSet<string>();
-            foreach (var drop in drops)
-            {
-                keep.Add(drop.Id);
-                if (!gems.TryGetValue(drop.Id, out var entry))
-                {
-                    var gem = Gem.Create(drop, transform, 1f, Layer);
-                    entry = (gem, drop);
-                }
-                entry.drop = drop;
-                entry.gem.transform.position = World(drop.Lat, drop.Lng);
-                gems[drop.Id] = entry;
-            }
-            foreach (var id in new List<string>(gems.Keys))
-            {
-                if (keep.Contains(id)) continue;
-                Destroy(gems[id].gem.gameObject);
-                gems.Remove(id);
-            }
+            drops.Clear();
+            foreach (var drop in list) drops[drop.Id] = drop;
+        }
+
+        /// <summary>
+        /// Where a drop's spot is on screen, in pixels from the bottom left, with its distance
+        /// from the camera in z. False when the map isn't showing or the spot is behind the camera.
+        /// </summary>
+        public bool ScreenOf(DropInfo drop, out Vector3 screen)
+        {
+            screen = default;
+            if (!hasOrigin || Camera == null || !Camera.enabled) return false;
+            screen = Camera.WorldToScreenPoint(World(drop.Lat, drop.Lng) + Vector3.up * 1.5f);
+            return screen.z > 0;
         }
 
         public void Recenter()
@@ -226,11 +222,10 @@ namespace Hololoco
                 var t = Mathf.Repeat(Time.time / 2f, 1f);
                 var radius = Mathf.Lerp(unit * 0.6f, SightRadius, 1f - (1f - t) * (1f - t));
                 rings[i].localScale = Vector3.one * (2f * radius / unit);
-                var ringColour = GameMap ? new Color(0.3f, 0.95f, 1f) : new Color(0f, 0.55f, 0.7f);
-                ringColour.a = (1 - t) * (GameMap ? 0.8f : 0.7f);
-                rings[i].GetComponent<Renderer>().material.SetColor("_Color", ringColour);
+                var colour = ringColour;
+                colour.a = (1 - t) * (GameMap ? 0.8f : 0.7f);
+                rings[i].GetComponent<Renderer>().material.SetColor("_Color", colour);
             }
-            foreach (var (gem, _) in gems.Values) gem.transform.localScale = Vector3.one * unit * 1.4f;
             if (route != null) route.widthMultiplier = unit * 0.35f;
 
             var (mx, my) = MercatorOf(focus);
@@ -265,7 +260,6 @@ namespace Hololoco
                     Bearing += t0.deltaPosition.x * 0.25f;
                     Pitch = Mathf.Clamp(Pitch - t0.deltaPosition.y * 0.12f, 25f, 80f);
                 }
-                if (t0.phase == TouchPhase.Ended && !moved && Time.time - gestureStartTime < 0.5f) Tap(t0.position);
             }
             else if (Input.touchCount == 2)
             {
@@ -286,17 +280,6 @@ namespace Hololoco
                     var forward = Vector3.ProjectOnPlane(Camera.transform.forward, Vector3.up).normalized;
                     focus -= (right * middle.x + forward * middle.y / Mathf.Sin(Pitch * Mathf.Deg2Rad)) * metresPerPixel;
                 }
-            }
-        }
-
-        void Tap(Vector2 screen)
-        {
-            var ray = Camera.ScreenPointToRay(screen);
-            if (Physics.Raycast(ray, out var hit, 5000f, 1 << Layer))
-            {
-                var gem = hit.collider.GetComponentInParent<Gem>();
-                foreach (var (g, drop) in gems.Values)
-                    if (g == gem) { Tapped?.Invoke(drop); return; }
             }
         }
 
@@ -418,15 +401,18 @@ namespace Hololoco
             done(data);
         }
 
-        /// <summary>Switches between Mapbox's classic look and the dark game map.</summary>
-        public void SetGameMap(bool game)
+        /// <summary>Colours the map for a skin: the Mapbox style, buildings, ring, route and gems.</summary>
+        public void SetLook(Skin skin)
         {
+            var game = skin.DarkMap;
             var changed = game != GameMap;
             GameMap = game;
-            Camera.backgroundColor = game ? new Color(0.035f, 0.06f, 0.11f) : new Color(0.93f, 0.93f, 0.91f);
-            buildingMaterial.SetColor("_Color", game ? new Color(0.11f, 0.15f, 0.23f) : new Color(0.78f, 0.8f, 0.84f));
-            buildingMaterial.SetColor("_Top", game ? new Color(0.2f, 0.27f, 0.38f) : new Color(0.95f, 0.95f, 0.96f));
-            glowMaterial.SetColor("_Color", game ? new Color(0.3f, 0.95f, 1f) : new Color(0f, 0.55f, 0.7f));
+            Camera.backgroundColor = skin.MapBackground;
+            buildingMaterial.SetColor("_Color", skin.BuildingWall);
+            buildingMaterial.SetColor("_Top", skin.BuildingTop);
+            ringColour = skin.Accent;
+            glowMaterial.SetColor("_Color", skin.Accent);
+            if (avatarGem != null) avatarGem.SetColour(skin.Accent);
             glowMaterial.SetFloat("_DstBlend", game ? (float)UnityEngine.Rendering.BlendMode.One : (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
             foreach (var r in GetComponentsInChildren<Renderer>(true))
                 if (r.sharedMaterial != null && r.sharedMaterial.shader == glowMaterial.shader)
@@ -454,12 +440,14 @@ namespace Hololoco
             avatar = new GameObject("avatar") { layer = Layer }.transform;
             avatar.SetParent(transform, false);
 
-            // A teal gem for the player, a pointer showing which way they face, and pulsing hexagons.
+            // A gem in the skin's accent for the player, a pointer showing which way they face, and a pulsing ring.
             var body = Gem.Create(new DropInfo { Id = "me", Type = "offer", Rarity = "common" }, avatar, 1.1f, Layer);
             body.Spin = 25f;
+            body.SetColour(Skin.Current.Accent);
+            avatarGem = body;
             Destroy(body.GetComponent<Collider>());
 
-            var hex = Resources.Load<Texture2D>("Art/hex_outline");
+            var circle = RingTexture();
             // An arrowhead in front of the avatar, turned to the compass heading.
             var arrow = new GameObject("pointer") { layer = Layer };
             arrow.transform.SetParent(avatar, false);
@@ -471,10 +459,39 @@ namespace Hololoco
             arrow.AddComponent<MeshFilter>().sharedMesh = arrowMesh;
             arrow.AddComponent<MeshRenderer>().sharedMaterial = new Material(glowMaterial) { mainTexture = Texture2D.whiteTexture };
             pointer = arrow.transform;
-            var ring = Quad("ring", avatar, hex, 1f);
+            var ring = Quad("ring", avatar, circle, 1f);
             ring.localPosition = new Vector3(0, 0.08f, 0);
             ring.localRotation = Quaternion.Euler(90, 0, 0);
             rings.Add(ring);
+        }
+
+        static Texture2D ringTexture;
+
+        /// <summary>A soft white circle outline, tinted by the material: the map's pulse and the AR ring.</summary>
+        public static Texture2D RingTexture()
+        {
+            if (ringTexture == null) ringTexture = MakeRing();
+            return ringTexture;
+        }
+
+        static Texture2D MakeRing()
+        {
+            const int size = 256;
+            var texture = new Texture2D(size, size, TextureFormat.RGBA32, false) { wrapMode = TextureWrapMode.Clamp };
+            var pixels = new Color32[size * size];
+            for (var y = 0; y < size; y++)
+            for (var x = 0; x < size; x++)
+            {
+                var dx = (x + 0.5f) / size * 2f - 1f;
+                var dy = (y + 0.5f) / size * 2f - 1f;
+                var r = Mathf.Sqrt(dx * dx + dy * dy);
+                // A ring near the edge, about 3% of the radius wide, with soft sides.
+                var a = Mathf.Clamp01(1f - Mathf.Abs(r - 0.95f) / 0.03f);
+                pixels[y * size + x] = new Color32(255, 255, 255, (byte)(a * 255));
+            }
+            texture.SetPixels32(pixels);
+            texture.Apply();
+            return texture;
         }
 
         Transform Quad(string name, Transform parent, Texture texture, float size)

@@ -1,0 +1,50 @@
+/* Daylight, the default skin: bright, friendly and easy to read outdoors.
+   Teal for actions, gold for rare things, Outfit for headings and DM Sans for text. */
+
+.app {
+    --bg: #f2f5f7;
+    --surface: #ffffff;
+    --surface-2: #f2f5f7;
+    --float: #ffffff;
+    --float-line: #e1e7ec;
+    --card-line: #e6ebef;
+    --nav-bg: #ffffff;
+    --nav-pill: rgba(0, 0, 0, 0);
+    --line: #e1e7ec;
+    --line-strong: #c9d3db;
+    --track: #dde4e9;
+    --ink: #15212c;
+    --muted: #5a6875;
+    --accent: #00788a;
+    --on-accent: #ffffff;
+    --accent-soft: #e1f4f6;
+    --warm: #9a5b00;
+    --warm-soft: #fff1db;
+    --danger: #b3261e;
+    --scrim: rgba(21, 33, 44, 0.45);
+
+    --common: #8796a3;
+    --common-soft: #eef2f5;
+    --common-ink: #5f6e7b;
+    --uncommon: #2fa36a;
+    --uncommon-soft: #e3f5ea;
+    --uncommon-ink: #176f42;
+    --rare: #f2b13a;
+    --rare-soft: #fdf0d5;
+    --rare-ink: #8c5800;
+    --on-rare: #3d2600;
+
+    --radius-card: 24px;
+    --radius-sheet: 28px;
+    --radius-button: 18px;
+    --radius-tile: 16px;
+    --radius-thumb: 18px;
+    --radius-chip: 10px;
+    --pin-bg: #ffffff;
+    --nav-clear: 98px;
+    --page-bottom: 112px;
+}
+
+.app, .unity-text-element { -unity-font-definition: resource("Fonts/DMSans-Regular"); }
+.strong, .lead, .action, .chip, .nav-label, .segment, .look-chip, .tile-badge, .count-pill, .toast, .switch > .unity-base-field__label { -unity-font-definition: resource("Fonts/DMSans-Bold"); }
+.display, .h1, .title, .big, .code, .stat-value, .avatar { -unity-font-definition: resource("Fonts/Outfit-SemiBold"); }

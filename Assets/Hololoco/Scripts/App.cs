@@ -1,13 +1,17 @@
-// The Hololoco app, following old Coupemon's flow with today's tools:
+// The Hololoco app. Its look comes from the skin (Skin.cs and Resources/Skins);
+// Daylight is the default, and people pick another under Me > Look.
 //
-//   Map (home)  a tilted dark map with your avatar and a gem for each drop nearby.
-//               Tap a gem for its card: "Open in AR" when you're close, or "Walk there".
-//   AR          "Hold your phone up": the drop appears in front of you. Capture it
-//               (an offer's gem breaks open to reveal the item) or Leave it. Take a photo.
-//   Bag         what you've collected, turning in 3D: Redeem (a code for the counter),
-//               View in AR, Leave here (for someone else), Throw away.
-//   Drop        leave a message where you're standing.
-//   Me          level, XP, your trading name, settings, sign out.
+//   Map (home)  a tilted 3D map with your avatar and a pin for each drop nearby,
+//               cards for the closest ones, and a drop's card when you tap one:
+//               "Open in AR" when you're close, or "Walk there".
+//   Quests      the quest you're on, stop by stop, and quests starting nearby.
+//   Scan        opens AR on the closest drop you can reach.
+//   AR          the app finds the ground a few steps ahead and anchors the item's own
+//               3D model there, locked to the spot. Capture it or leave it. Take a photo.
+//   Bag         what you've collected: Redeem (a code for the counter), View in AR,
+//               Leave it here (for someone else), Throw away.
+//   Me          level and XP, the Look (skin), settings, your trading name, sign out.
+//   +           leave a message where you're standing.
 //
 // Everything goes through the database functions in the website's docs/app-api.md.
 
@@ -37,18 +41,26 @@ namespace Hololoco
 
         enum Mode { Map, Encounter, ViewItem }
         Mode mode = Mode.Map;
-        string panel; // null (just the map), "bag", "drop" or "me"
+        string panel; // null (just the map), "quests", "bag", "me" or "drop"
 
-        VisualElement root, top, bar, sheet, card, arUi, banner;
-        Label status, chip, toast;
+        VisualElement root, pinLayer, top, tools, nav, page, card, arUi, banner, levelFill;
+        readonly Dictionary<string, (VisualElement pin, DropInfo drop)> pins = new();
+        string selectedPin;
+        float pinsSortedAt;
+        ScrollView nearbyStrip, pageScroll;
+        Label status, toast, levelText, avatarLetter, countPill;
+        Icon compassIcon;
+        StyleSheet skinSheet;
         float toastUntil, bannerUntil;
 
         List<DropInfo> nearby = new();
         JArray bag = new();
+        JArray myQuests = new();
+        JArray nearbyQuests = new();
         JObject player;
-        JToken selectedItem;
         DropInfo selectedDrop;
         DropInfo encounterDrop;
+        string bagFilter = "all";
         double lastLat, lastLng;
         float lastFetch = -999f;
         bool fetching;
@@ -65,72 +77,148 @@ namespace Hololoco
         void Start()
         {
             Screen.sleepTimeout = SleepTimeout.NeverSleep;
+            Skin.Load();
             root = Document.rootVisualElement;
-            var style = Resources.Load<StyleSheet>("hololoco");
-            if (style != null) root.styleSheets.Add(style);
+            var layout = Resources.Load<StyleSheet>("hololoco");
+            if (layout != null) root.styleSheets.Add(layout);
             root.AddToClassList("app");
             root.pickingMode = PickingMode.Ignore;
             LoadAlerted();
             BuildChrome();
+            ApplySkin(Skin.Current);
+            Skin.Changed += ApplySkin;
             Map.IsOverUi = OverUi;
-            Map.Tapped += SelectDrop;
             Map.SetBuildings(PlayerPrefs.GetInt("hl.buildings", 1) == 1);
-            Map.SetGameMap(PlayerPrefs.GetInt("hl.gamemap", 0) == 1);
             SetMode(Mode.Map);
             if (!Supabase.SignedIn) ShowSignIn();
             _ = RefreshPlayer();
         }
 
+        void OnDestroy() => Skin.Changed -= ApplySkin;
+
+        /// <summary>Swaps the skin's style sheet and recolours the map and gems.</summary>
+        void ApplySkin(Skin skin)
+        {
+            if (skinSheet != null) root.styleSheets.Remove(skinSheet);
+            skinSheet = Resources.Load<StyleSheet>(skin.Sheet);
+            if (skinSheet != null) root.styleSheets.Add(skinSheet);
+            foreach (var s in Skin.All) root.EnableInClassList("skin-" + s.Id, s == skin);
+            Map.SetLook(skin);
+            Icon.Repaint(root);
+            if (panel != null) RenderPanel();
+        }
+
         void BuildChrome()
         {
+            // Pins for the drops, under everything else.
+            pinLayer = Div("pins");
+            pinLayer.pickingMode = PickingMode.Ignore;
+            root.Add(pinLayer);
+
+            // Top: your level (opens Me), how much is nearby, and a compass that points the map north.
             top = Div("top");
-            status = new Label { pickingMode = PickingMode.Ignore };
-            status.AddToClassList("status");
-            chip = new Label();
-            chip.AddToClassList("chip");
-            chip.style.display = DisplayStyle.None;
-            chip.RegisterCallback<ClickEvent>(_ => OpenPanel("me"));
-            top.Add(chip);
+            var pill = Div("level-pill");
+            pill.AddManipulator(new Clickable(() => OpenPanel("me")));
+            avatarLetter = Text("?", "avatar");
+            pill.Add(avatarLetter);
+            var column = Div("level-col");
+            levelText = Text("Level 1", "strong small");
+            column.Add(levelText);
+            var levelBar = Div("level-bar");
+            levelFill = Div("level-fill");
+            levelBar.Add(levelFill);
+            column.Add(levelBar);
+            pill.Add(column);
+            top.Add(pill);
+            countPill = Text("", "count-pill");
+            countPill.style.display = DisplayStyle.None;
+            top.Add(countPill);
+            top.Add(Div("top-spacer"));
+            var compass = Round("compass", () => Map.Bearing = 0f);
+            compassIcon = compass.Q<Icon>();
+            top.Add(compass);
             root.Add(top);
+
+            tools = Div("tools");
+            tools.Add(Round("recenter", () => { ClosePanel(); Map.Recenter(); }));
+            tools.Add(Round("plus", () => OpenPanel("drop")));
+            root.Add(tools);
+
+            status = Text("", "status");
+            status.pickingMode = PickingMode.Ignore;
             root.Add(status);
 
             banner = Div("banner");
             banner.style.display = DisplayStyle.None;
-            banner.RegisterCallback<ClickEvent>(_ =>
+            banner.AddManipulator(new Clickable(() =>
             {
                 banner.style.display = DisplayStyle.None;
                 if (bannerDrop != null) SelectDrop(bannerDrop);
-            });
+            }));
             root.Add(banner);
 
-            toast = new Label { pickingMode = PickingMode.Ignore };
-            toast.AddToClassList("toast");
-            toast.style.display = DisplayStyle.None;
-            root.Add(toast);
+            nearbyStrip = new ScrollView(ScrollViewMode.Horizontal)
+            {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Hidden,
+            };
+            nearbyStrip.AddToClassList("nearby");
+            root.Add(nearbyStrip);
 
-            sheet = Div("sheet");
-            sheet.style.display = DisplayStyle.None;
-            root.Add(sheet);
+            page = Div("page");
+            pageScroll = new ScrollView(ScrollViewMode.Vertical)
+            {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Hidden,
+            };
+            pageScroll.AddToClassList("page-scroll");
+            pageScroll.contentContainer.AddToClassList("page-body");
+            page.Add(pageScroll);
+            root.Add(page);
+
+            // The bottom bar: Map, Quests, Scan, Bag, Me.
+            nav = Div("nav");
+            foreach (var (id, icon, label) in new[] { ("map", "map", "Map"), ("quests", "quests", "Quests"), ("scan", "scan", "Scan"), ("bag", "bag", "Bag"), ("me", "me", "Me") })
+            {
+                var item = Div("nav-item");
+                item.name = id;
+                if (id == "scan")
+                {
+                    item.AddToClassList("nav-scan");
+                    var disc = Div("scan-disc");
+                    disc.pickingMode = PickingMode.Ignore;
+                    disc.Add(new Icon("scan", 28));
+                    item.Add(disc);
+                }
+                else
+                {
+                    var pillBox = Div("nav-pill");
+                    pillBox.pickingMode = PickingMode.Ignore;
+                    pillBox.Add(new Icon(icon, 24));
+                    item.Add(pillBox);
+                }
+                var words = new Label(label) { pickingMode = PickingMode.Ignore };
+                words.AddToClassList("nav-label");
+                item.Add(words);
+                item.AddManipulator(new Clickable(() => NavTapped(id)));
+                nav.Add(item);
+            }
+            root.Add(nav);
 
             card = Div("card-sheet");
             card.style.display = DisplayStyle.None;
             root.Add(card);
 
-            bar = Div("bar");
-            foreach (var (id, icon) in new[] { ("map", "icon_map"), ("bag", "icon_bag"), ("recenter", "icon_recenter"), ("drop", "icon_drop"), ("me", "icon_me") })
-            {
-                var button = new Button(() => BarTapped(id));
-                button.AddToClassList("hex-icon");
-                if (id == "recenter") button.AddToClassList("hex-icon-big");
-                button.style.backgroundImage = new StyleBackground(Resources.Load<Texture2D>("Art/" + icon));
-                button.name = id;
-                bar.Add(button);
-            }
-            root.Add(bar);
-
             arUi = Div("ar");
             arUi.style.display = DisplayStyle.None;
             root.Add(arUi);
+
+            toast = Text("", "toast");
+            toast.pickingMode = PickingMode.Ignore;
+            toast.style.display = DisplayStyle.None;
+            root.Add(toast);
+
+            SetNavSelected("map");
         }
 
         bool OverUi(Vector2 screen)
@@ -141,7 +229,7 @@ namespace Hololoco
             return picked != null && picked != root;
         }
 
-        // ================================================================ modes
+        // ================================================================ modes and what's showing
 
         void SetMode(Mode next)
         {
@@ -151,54 +239,114 @@ namespace Hololoco
             ArCamera.enabled = ar;
             MapCamera.enabled = !ar;
             if (ar) RenderSettings.fog = false;
-            top.style.display = ar ? DisplayStyle.None : DisplayStyle.Flex;
-            status.style.visibility = ar ? Visibility.Hidden : Visibility.Visible;
-            bar.style.display = ar ? DisplayStyle.None : DisplayStyle.Flex;
-            arUi.style.display = ar ? DisplayStyle.Flex : DisplayStyle.None;
             if (ar)
             {
-                sheet.style.display = DisplayStyle.None;
                 card.style.display = DisplayStyle.None;
                 Preview.SetVisible(false);
             }
             else
             {
                 Encounter.Clear();
-                if (panel != null) OpenPanel(panel);
+                if (panel != null) RenderPanel();
             }
+            UpdateChrome();
         }
 
-        void BarTapped(string id)
+        /// <summary>Shows what belongs on screen for the mode, the open page and the open card.</summary>
+        void UpdateChrome()
+        {
+            var onMap = mode == Mode.Map;
+            var cardOpen = card.style.display == DisplayStyle.Flex;
+            var mapClear = onMap && panel == null;
+            Show(top, mapClear);
+            Show(pinLayer, mapClear);
+            Show(tools, mapClear && !cardOpen);
+            Show(nearbyStrip, mapClear && !cardOpen && nearbyStrip.childCount > 0);
+            Show(page, onMap && panel != null);
+            Show(nav, onMap && !cardOpen);
+            Show(arUi, !onMap);
+            if (!mapClear) banner.style.display = DisplayStyle.None;
+        }
+
+        static void Show(VisualElement e, bool show) => e.style.display = show ? DisplayStyle.Flex : DisplayStyle.None;
+
+        void NavTapped(string id)
         {
             switch (id)
             {
-                case "map": ClosePanel(); break;
-                case "recenter": ClosePanel(); Map.Recenter(); break;
+                case "map":
+                    CloseCard();
+                    ClosePanel();
+                    break;
+                case "scan":
+                    Scan();
+                    break;
                 default:
-                    if (panel == id) ClosePanel();
-                    else OpenPanel(id);
+                    OpenPanel(id);
                     break;
             }
+        }
+
+        void SetNavSelected(string id)
+        {
+            foreach (var item in nav.Children()) item.EnableInClassList("selected", item.name == id);
+            Icon.Repaint(nav);
         }
 
         void OpenPanel(string id)
         {
             panel = id;
             card.style.display = DisplayStyle.None;
-            sheet.style.display = DisplayStyle.Flex;
-            foreach (var b in bar.Children()) b.EnableInClassList("selected", b.name == id);
-            Preview.SetVisible(id == "bag");
+            Preview.SetVisible(false);
+            SetNavSelected(id == "drop" ? "map" : id);
             RenderPanel();
+            pageScroll.scrollOffset = Vector2.zero;
+            UpdateChrome();
             if (id == "bag") _ = RefreshBag();
             if (id == "me") _ = RefreshPlayer();
+            if (id == "quests") _ = RefreshQuests();
         }
 
         void ClosePanel()
         {
             panel = null;
-            sheet.style.display = DisplayStyle.None;
             Preview.SetVisible(false);
-            foreach (var b in bar.Children()) b.EnableInClassList("selected", b.name == "map");
+            SetNavSelected("map");
+            UpdateChrome();
+        }
+
+        void CloseCard()
+        {
+            card.style.display = DisplayStyle.None;
+            Map.SetRoute(null);
+            MarkSelectedPin(null);
+            UpdateChrome();
+        }
+
+        /// <summary>The middle button: AR on the closest drop within reach, or the way to the nearest one.</summary>
+        void Scan()
+        {
+            if (!Location.HasFix)
+            {
+                ShowToast("Finding your location…");
+                return;
+            }
+            var open = nearby.Where(d => !d.Mine && !(d.Captured && d.QuestName == null)).OrderBy(DistanceTo).ToList();
+            var reachable = open.FirstOrDefault(CloseEnough);
+            if (reachable != null)
+            {
+                ClosePanel();
+                OpenInAr(reachable);
+                return;
+            }
+            if (open.Count == 0)
+            {
+                ShowToast("Nothing to scan around here yet.");
+                return;
+            }
+            ClosePanel();
+            SelectDrop(open[0]);
+            ShowToast($"Nothing close enough yet. The nearest is {Words.Distance(DistanceTo(open[0]))} away.");
         }
 
         // ================================================================ every frame
@@ -208,9 +356,10 @@ namespace Hololoco
             if (Location.HasFix) Map.SetPlayer(Location.Lat, Location.Lng, Location.Heading);
             status.text = Location.Denied ? "Hololoco needs your location to show what's around."
                 : !Location.HasFix ? "Finding your location…" : "";
-            status.style.display = status.text.Length > 0 ? DisplayStyle.Flex : DisplayStyle.None;
+            Show(status, status.text.Length > 0 && mode == Mode.Map && panel == null);
             if (toast.style.display == DisplayStyle.Flex && Time.time > toastUntil) toast.style.display = DisplayStyle.None;
             if (banner.style.display == DisplayStyle.Flex && Time.time > bannerUntil) banner.style.display = DisplayStyle.None;
+            if (compassIcon != null) compassIcon.style.rotate = new Rotate(new Angle(-Map.Bearing, AngleUnit.Degree));
 
             if (Location.HasFix)
             {
@@ -219,18 +368,93 @@ namespace Hololoco
             }
 
             if (mode == Mode.Map && card.style.display == DisplayStyle.Flex && selectedDrop != null) RenderCardDistance();
+            if (mode == Mode.Map && panel == null) PlacePins();
+            if (mode != Mode.Map && arChipWords != null && Encounter.Locked && arChipWords.text != "Locked to this spot")
+                arChipWords.text = "Locked to this spot";
             HandleArTap();
         }
 
-        /// <summary>In AR, tapping the gem captures it too.</summary>
+        /// <summary>In AR, tapping the item captures it too.</summary>
         void HandleArTap()
         {
-            if (mode != Mode.Encounter || Input.touchCount != 1) return;
+            if (mode != Mode.Encounter || Encounter.Searching || Input.touchCount != 1) return;
             var touch = Input.GetTouch(0);
             if (touch.phase != TouchPhase.Ended || OverUi(touch.position)) return;
             if (Physics.Raycast(ArCamera.ScreenPointToRay(touch.position), out var hit, 20f, ~(1 << MapView.Layer | 1 << Preview.Layer))
-                && hit.collider.GetComponentInParent<Gem>() != null)
+                && Encounter.IsPart(hit.collider))
                 _ = CaptureInAr();
+        }
+
+        // ================================================================ pins on the map
+
+        /// <summary>One pin per drop: made, kept or removed to match what's nearby.</summary>
+        void SyncPins()
+        {
+            var keep = new HashSet<string>();
+            foreach (var drop in nearby)
+            {
+                keep.Add(drop.Id);
+                if (pins.TryGetValue(drop.Id, out var entry))
+                {
+                    pins[drop.Id] = (entry.pin, drop);
+                    continue;
+                }
+                var pin = Div("pin " + RarityClass("pin", drop.Type, drop.Rarity));
+                if (drop.Mine) pin.AddToClassList("mine");
+                var label = Text(drop.Title, "pin-label strong one-line");
+                label.pickingMode = PickingMode.Ignore;
+                pin.Add(label);
+                var disc = Div("pin-disc");
+                disc.pickingMode = PickingMode.Ignore;
+                disc.Add(new Icon(Icon.For(drop.Type, drop.ObjectId), 22));
+                pin.Add(disc);
+                var tail = Div("pin-tail");
+                tail.pickingMode = PickingMode.Ignore;
+                pin.Add(tail);
+                var id = drop.Id;
+                pin.AddManipulator(new Clickable(() =>
+                {
+                    if (pins.TryGetValue(id, out var current)) SelectDrop(current.drop);
+                }));
+                pinLayer.Add(pin);
+                pins[drop.Id] = (pin, drop);
+            }
+            foreach (var id in pins.Keys.Where(k => !keep.Contains(k)).ToList())
+            {
+                pins[id].pin.RemoveFromHierarchy();
+                pins.Remove(id);
+            }
+            MarkSelectedPin(selectedPin);
+            Icon.Repaint(pinLayer);
+        }
+
+        /// <summary>Moves each pin to its drop's spot on screen; nearer pins drawn on top.</summary>
+        void PlacePins()
+        {
+            if (root.panel == null || pins.Count == 0) return;
+            var depths = new List<(float z, VisualElement pin)>();
+            foreach (var (pin, drop) in pins.Values)
+            {
+                if (!Map.ScreenOf(drop, out var s))
+                {
+                    pin.style.visibility = Visibility.Hidden;
+                    continue;
+                }
+                var p = RuntimePanelUtils.ScreenToPanel(root.panel, new Vector2(s.x, Screen.height - s.y));
+                pin.style.visibility = Visibility.Visible;
+                pin.style.translate = new Translate(p.x - 26f, p.y - 64f);
+                depths.Add((s.z, pin));
+            }
+            if (Time.time - pinsSortedAt < 0.5f) return;
+            pinsSortedAt = Time.time;
+            foreach (var (_, pin) in depths.OrderByDescending(d => d.z)) pin.BringToFront();
+            if (selectedPin != null && pins.TryGetValue(selectedPin, out var chosen)) chosen.pin.BringToFront();
+        }
+
+        void MarkSelectedPin(string id)
+        {
+            selectedPin = id;
+            foreach (var (key, entry) in pins) entry.pin.EnableInClassList("selected", key == id);
         }
 
         // ================================================================ data
@@ -245,9 +469,12 @@ namespace Hololoco
                 lastLat = lat;
                 lastLng = lng;
                 nearby = ((JArray)result["drops"]).Select(DropInfo.From).ToList();
+                nearbyQuests = result["quests"] as JArray ?? new JArray();
                 Map.SightRadius = (float?)result["radius"] ?? Map.SightRadius;
                 Map.ShowDrops(nearby);
                 if (result["player"] is JObject p) SetPlayer(p);
+                SyncPins();
+                RenderNearby();
                 AlertIfNear();
             }
             catch (Exception e)
@@ -275,6 +502,20 @@ namespace Hololoco
             }
         }
 
+        async Task RefreshQuests()
+        {
+            if (!Supabase.SignedIn) return;
+            try
+            {
+                myQuests = await Supabase.Rpc("my_quests") as JArray ?? new JArray();
+                if (panel == "quests") RenderPanel();
+            }
+            catch (Exception e)
+            {
+                ShowToast(Words.For(e));
+            }
+        }
+
         async Task RefreshPlayer()
         {
             if (!Supabase.SignedIn) return;
@@ -284,21 +525,65 @@ namespace Hololoco
             }
             catch (Exception)
             {
-                // The chip stays as it was.
+                // The level pill stays as it was.
             }
         }
 
         void SetPlayer(JObject p)
         {
             player = p;
-            chip.text = $"Lv {(int?)p["level"] ?? 1}  ·  {(int?)p["xp"] ?? 0} XP";
+            var level = (int?)p["level"] ?? 1;
+            levelText.text = $"Level {level}";
+            levelFill.style.width = Length.Percent(LevelProgress() * 100f);
+            avatarLetter.text = Initial();
             Map.SightRadius = (float?)p["sightMetres"] ?? Map.SightRadius;
-            chip.style.display = DisplayStyle.Flex;
             if (panel == "me") RenderPanel();
+        }
+
+        float LevelProgress()
+        {
+            if (player == null) return 0;
+            var xp = (int?)player["xp"] ?? 0;
+            var from = (int?)player["levelXp"] ?? 0;
+            var to = (int?)player["nextLevelXp"] ?? 100;
+            return Mathf.Clamp01((xp - from) / (float)Mathf.Max(to - from, 1));
+        }
+
+        string Initial()
+        {
+            var name = (string)player?["handle"];
+            if (string.IsNullOrEmpty(name)) name = Supabase.Email;
+            return string.IsNullOrEmpty(name) ? "?" : char.ToUpperInvariant(name[0]).ToString();
         }
 
         float DistanceTo(DropInfo d) => Geo.Distance(Location.Lat, Location.Lng, d.Lat, d.Lng);
         bool CloseEnough(DropInfo d) => Location.HasFix && DistanceTo(d) <= 40f + Mathf.Min(Location.Accuracy, 30f);
+        float Metres(DropInfo d) => Location.HasFix ? DistanceTo(d) : d.Distance;
+        static string Walk(float metres) => $"{Mathf.Max(1, Mathf.RoundToInt(metres / 80f))} min walk";
+
+        // ================================================================ nearby cards
+
+        void RenderNearby()
+        {
+            nearbyStrip.Clear();
+            var others = nearby.Where(d => !d.Mine).ToList();
+            foreach (var drop in others.OrderBy(Metres).Take(6))
+            {
+                var c = Div("near-card");
+                c.Add(Thumb(drop.Type, drop.Rarity, drop.ObjectId));
+                var words = Div("near-text");
+                words.Add(Chip(drop.Type, drop.Rarity));
+                words.Add(Text(drop.Title, "strong lead one-line"));
+                words.Add(Text($"{drop.OwnerName} · {Walk(Metres(drop))}", "muted small one-line mt-2"));
+                c.Add(words);
+                var chosen = drop;
+                c.AddManipulator(new Clickable(() => SelectDrop(chosen)));
+                nearbyStrip.Add(c);
+            }
+            countPill.text = others.Count == 1 ? "1 thing nearby" : $"{others.Count} things nearby";
+            Show(countPill, others.Count > 0);
+            UpdateChrome();
+        }
 
         // ================================================================ near-a-drop alerts
 
@@ -310,7 +595,7 @@ namespace Hololoco
 
         void AlertIfNear()
         {
-            if (PlayerPrefs.GetInt("hl.alerts", 1) != 1 || mode != Mode.Map) return;
+            if (PlayerPrefs.GetInt("hl.alerts", 1) != 1 || mode != Mode.Map || panel != null) return;
             var near = nearby.FirstOrDefault(d => !d.Mine && !d.Captured && !alerted.Contains(d.Id) && DistanceTo(d) <= 50f);
             if (near == null) return;
             alerted.Add(near.Id);
@@ -319,8 +604,11 @@ namespace Hololoco
             Handheld.Vibrate();
 #endif
             banner.Clear();
-            banner.Add(Text($"You're near {near.Title}", "title"));
-            banner.Add(Text(near.Savings ?? "Tap to have a look.", "muted"));
+            banner.Add(new Icon("pin", 26));
+            var words = Div("grow ml-12");
+            words.Add(Text($"You're near {near.Title}", "strong"));
+            words.Add(Text(near.Savings ?? "Tap to have a look.", "muted small mt-2"));
+            banner.Add(words);
             bannerDrop = near;
             banner.style.display = DisplayStyle.Flex;
             bannerUntil = Time.time + 8f;
@@ -328,36 +616,51 @@ namespace Hololoco
 
         // ================================================================ a drop's card
 
+        Label cardDistance, cardWalk;
+
         void SelectDrop(DropInfo drop)
         {
             selectedDrop = drop;
+            MarkSelectedPin(drop.Id);
             Map.SetRoute(null);
-            ClosePanel();
+            panel = null;
+            SetNavSelected("map");
             card.Clear();
             card.style.display = DisplayStyle.Flex;
 
+            card.Add(Div("handle"));
             var head = Div("row");
-            var gemDot = Div("gem-dot");
-            gemDot.style.backgroundColor = Gem.ColourFor(drop);
-            head.Add(gemDot);
-            var info = Div("grow");
-            info.Add(Text(drop.Title, "title"));
-            info.Add(Text($"{Words.Kind(drop)} · {drop.OwnerName}", "muted"));
+            head.Add(Thumb(drop.Type, drop.Rarity, drop.ObjectId, true));
+            var info = Div("head-text");
+            info.Add(Chip(drop.Type, drop.Rarity));
+            info.Add(Text(drop.Title, "display"));
+            info.Add(Text(drop.OwnerName, "muted mt-2"));
             head.Add(info);
-            head.Add(Action("×", () => { card.style.display = DisplayStyle.None; Map.SetRoute(null); }, "close"));
             card.Add(head);
-            if (drop.Savings != null) card.Add(Text(drop.Savings, "savings"));
-            var worth = Words.Value(drop.ValueNowCents, drop.DecayPercent, drop.DecayDays);
-            if (worth != null) card.Add(Text(worth, "muted"));
-            if (!string.IsNullOrEmpty(drop.Description)) card.Add(Text(drop.Description, "muted"));
-            if (drop.QuestName != null) card.Add(Text($"Quest stage {drop.QuestStage} of {drop.QuestStages}: {drop.QuestName}", "muted"));
-            var distance = Text("", "distance");
-            distance.name = "distance";
-            card.Add(distance);
-            var buttons = Div("buttons-row");
+            var close = Div("close-x");
+            close.Add(new Icon("close", 20));
+            close.AddManipulator(new Clickable(CloseCard));
+            card.Add(close);
+
+            if (drop.Savings != null) card.Add(Text(drop.Savings, "strong lead mt-16"));
+            if (!string.IsNullOrEmpty(drop.Description)) card.Add(Text(drop.Description, "muted mt-8"));
+
+            var stats = Div("stats");
+            cardDistance = Stat(stats, "", "away");
+            cardWalk = Stat(stats, "", "walk");
+            if (drop.ValueNowCents >= 0) Stat(stats, Words.Money(drop.ValueNowCents), "worth now");
+            card.Add(stats);
+
+            if (drop.ValueNowCents >= 0 && drop.DecayPercent > 0)
+                card.Add(Notice("clock", Words.Value(drop.ValueNowCents, drop.DecayPercent, drop.DecayDays), "warm"));
+            if (drop.QuestName != null)
+                card.Add(Notice("quests", $"Stop {drop.QuestStage} of {drop.QuestStages} of {drop.QuestName}", "accent"));
+
+            var buttons = Div("stack mt-4");
             buttons.name = "buttons";
             card.Add(buttons);
             RenderCardDistance(true);
+            UpdateChrome();
         }
 
         bool lastClose;
@@ -365,18 +668,28 @@ namespace Hololoco
         {
             var drop = selectedDrop;
             var close = CloseEnough(drop) && !drop.Mine && !(drop.Captured && drop.QuestName == null);
-            card.Q<Label>("distance").text = Location.HasFix ? $"{Words.Distance(DistanceTo(drop))} away" : "Finding your location…";
+            if (Location.HasFix)
+            {
+                var metres = DistanceTo(drop);
+                cardDistance.text = Words.Distance(metres);
+                cardWalk.text = $"{Mathf.Max(1, Mathf.RoundToInt(metres / 80f))} min";
+            }
+            else
+            {
+                cardDistance.text = "…";
+                cardWalk.text = "…";
+            }
             if (!force && close == lastClose) return;
             lastClose = close;
             var buttons = card.Q("buttons");
             buttons.Clear();
-            if (drop.Mine) buttons.Add(Text("This one is yours.", "muted"));
-            else if (drop.Captured && drop.QuestName == null) buttons.Add(Text("You've captured this one.", "muted"));
-            else if (close) buttons.Add(Action("Open in AR", () => OpenInAr(drop), "hex-primary"));
+            if (drop.Mine) buttons.Add(Text("This one is yours.", "muted mt-12"));
+            else if (drop.Captured && drop.QuestName == null) buttons.Add(Text("You've collected this one.", "muted mt-12"));
+            else if (close) buttons.Add(Action("Open in AR", () => OpenInAr(drop), drop.Rarity == "rare" ? "rare" : "primary"));
             else
             {
-                buttons.Add(Action("Walk there", () => _ = WalkTo(drop), "hex-primary"));
-                buttons.Add(Text("Get within about 40 m to open it in AR.", "muted"));
+                buttons.Add(Action("Walk there", () => _ = WalkTo(drop), "primary"));
+                buttons.Add(Text("Get within about 40 m to open it in AR.", "muted small center mt-8"));
             }
         }
 
@@ -429,32 +742,56 @@ namespace Hololoco
             if (mode == Mode.Encounter && encounterDrop == drop) RenderArChoice();
         }
 
+        /// <summary>The chip at the top of AR: locked to a surface, or standing in front of the player.</summary>
+        (string icon, string words) PlacedChip() => Encounter.Locked ? ("pin", "Locked to this spot") : ("pin", "Standing in front of you");
+
+        Label arChipWords;
+
+        VisualElement ArTop(Action close, string chipIcon = null, string chipText = null)
+        {
+            var row = Div("ar-top");
+            row.Add(Round("close", close));
+            arChipWords = null;
+            if (chipText != null)
+            {
+                var chip = Div("ar-chip");
+                chip.Add(new Icon(chipIcon, 18));
+                arChipWords = Text(chipText, "strong");
+                chip.Add(arChipWords);
+                row.Add(chip);
+            }
+            return row;
+        }
+
         void RenderArLooking()
         {
             arUi.Clear();
+            arUi.Add(ArTop(() => SetMode(Mode.Map)));
             var hint = Div("ar-hint");
-            var picture = Div("ar-hint-picture");
-            picture.style.backgroundImage = new StyleBackground(Resources.Load<Texture2D>("Art/hold_phone_up"));
-            hint.Add(picture);
-            hint.Add(Text("HOLD YOUR PHONE UP AND LOOK STRAIGHT AHEAD", "ar-hint-text"));
+            hint.Add(new Icon("scan", 44));
+            hint.Add(Text("Point your phone at the ground a few steps away", "strong center mt-12"));
+            hint.Add(Text("Move it slowly so your phone can find the floor.", "muted small center mt-4"));
             arUi.Add(hint);
-            var bottom = Div("ar-bottom");
-            bottom.Add(Action("Back to the map", () => SetMode(Mode.Map), "hex-secondary"));
-            arUi.Add(bottom);
+            arUi.Add(Div());
         }
 
         void RenderArChoice()
         {
             arUi.Clear();
             var drop = encounterDrop;
-            var head = Div("ar-head");
-            head.Add(Text(drop.Title, "ar-title"));
-            head.Add(Text(drop.Savings ?? Words.Kind(drop), "ar-sub"));
-            arUi.Add(head);
-            var bottom = Div("ar-bottom");
-            bottom.Add(Action("CAPTURE", () => _ = CaptureInAr(), "hex-primary"));
-            bottom.Add(Action("LEAVE", () => StartCoroutine(LeaveInAr()), "hex-secondary"));
-            arUi.Add(bottom);
+            var (chipIcon, chipWords) = PlacedChip();
+            arUi.Add(ArTop(() => StartCoroutine(LeaveInAr()), chipIcon, chipWords));
+            arUi.Add(Div());
+            var box = Div("ar-card");
+            box.Add(Chip(drop.Type, drop.Rarity));
+            box.Add(Text(drop.Title, "display"));
+            box.Add(Text(drop.Savings ?? drop.OwnerName, "muted mt-4"));
+            box.Add(Text(Encounter.Locked ? "It stays right there. Walk around it, then tap it or Capture." : "Tap it or Capture when you're ready.", "muted small mt-8"));
+            var buttons = Div("buttons");
+            buttons.Add(Action("Leave it", () => StartCoroutine(LeaveInAr()), "secondary"));
+            buttons.Add(Action("Capture", () => _ = CaptureInAr(), drop.Rarity == "rare" ? "rare" : "primary"));
+            box.Add(buttons);
+            arUi.Add(box);
         }
 
         bool capturing;
@@ -488,24 +825,26 @@ namespace Hololoco
         IEnumerator AfterCapture(DropInfo drop, JToken result)
         {
             yield return Encounter.Captured(drop.Json);
-            var lines = new List<string>();
-            if (result["quest"] is JObject q)
-                lines.Add((bool?)q["completed"] == true ? $"Quest complete! +{(int?)result["points"] ?? 0} points"
-                    : $"Quest stage {(int?)q["stage"]} of {(int?)q["stageCount"]}");
-            foreach (var e in (JArray)result["events"] ?? new JArray())
-                lines.Add((bool?)e["completed"] == true ? "Event finished!" : $"Event stop {(int?)e["found"]} of {(int?)e["total"]}");
-            if (((JArray)result["rewards"])?.Count > 0) lines.Add("You got a reward too. It's in your bag.");
-
             arUi.Clear();
-            var head = Div("ar-head");
-            head.Add(Text($"+{(int?)result["xp"] ?? 0} XP", "ar-xp"));
-            head.Add(Text(result["item"]?.Type == JTokenType.Object ? $"{drop.Title} is in your bag." : drop.Title, "ar-title"));
-            foreach (var line in lines) head.Add(Text(line, "ar-sub"));
-            arUi.Add(head);
-            var bottom = Div("ar-bottom");
-            bottom.Add(Action("PHOTO", TakePhoto, "hex-secondary"));
-            bottom.Add(Action("DONE", () => SetMode(Mode.Map), "hex-primary"));
-            arUi.Add(bottom);
+            arUi.Add(ArTop(() => SetMode(Mode.Map)));
+            arUi.Add(Div());
+            var box = Div("ar-card");
+            var kept = result["item"]?.Type == JTokenType.Object;
+            box.Add(Text(kept ? "Added to your bag" : "Collected", "strong accent"));
+            box.Add(Text($"+{(int?)result["xp"] ?? 0} XP", drop.Rarity == "rare" ? "big rare-ink" : "big"));
+            box.Add(Text(drop.Title, "display"));
+            if (result["quest"] is JObject q)
+                box.Add(Notice("quests", (bool?)q["completed"] == true
+                    ? $"Quest complete · +{(int?)result["points"] ?? 0} points"
+                    : $"Quest stop {(int?)q["stage"]} of {(int?)q["stageCount"]} done", "accent"));
+            foreach (var e in (JArray)result["events"] ?? new JArray())
+                box.Add(Notice("pin", (bool?)e["completed"] == true ? "Event finished" : $"Event stop {(int?)e["found"]} of {(int?)e["total"]}", "accent"));
+            if (((JArray)result["rewards"])?.Count > 0) box.Add(Notice("gift", "You got a reward too. It's in your bag.", "rare"));
+            var buttons = Div("buttons");
+            buttons.Add(Action("Photo", TakePhoto, "secondary"));
+            buttons.Add(Action("Done", () => SetMode(Mode.Map), "primary"));
+            box.Add(buttons);
+            arUi.Add(box);
         }
 
         IEnumerator LeaveInAr()
@@ -518,15 +857,26 @@ namespace Hololoco
         void ViewItemInAr(JToken item)
         {
             SetMode(Mode.ViewItem);
+            RenderArLooking();
+            StartCoroutine(ShowItemInAr(item));
+        }
+
+        IEnumerator ShowItemInAr(JToken item)
+        {
+            yield return Encounter.ShowItem(item["drop"]);
+            if (mode != Mode.ViewItem) yield break;
             arUi.Clear();
-            var head = Div("ar-head");
-            head.Add(Text((string)item["title"], "ar-title"));
-            arUi.Add(head);
-            var bottom = Div("ar-bottom");
-            bottom.Add(Action("PHOTO", TakePhoto, "hex-secondary"));
-            bottom.Add(Action("DONE", () => SetMode(Mode.Map), "hex-primary"));
-            arUi.Add(bottom);
-            StartCoroutine(Encounter.ShowItem(item["drop"]));
+            var (chipIcon, chipWords) = PlacedChip();
+            arUi.Add(ArTop(() => SetMode(Mode.Map), chipIcon, chipWords));
+            arUi.Add(Div());
+            var box = Div("ar-card");
+            box.Add(Text((string)item["title"], "display"));
+            box.Add(Text("Walk around it and take a photo.", "muted mt-4"));
+            var buttons = Div("buttons");
+            buttons.Add(Action("Photo", TakePhoto, "secondary"));
+            buttons.Add(Action("Done", () => SetMode(Mode.Map), "primary"));
+            box.Add(buttons);
+            arUi.Add(box);
         }
 
         void TakePhoto()
@@ -537,106 +887,306 @@ namespace Hololoco
                 ShowToast));
         }
 
-        // ================================================================ panels
+        // ================================================================ pages
 
         void RenderPanel()
         {
-            sheet.Clear();
+            pageScroll.Clear();
             switch (panel)
             {
+                case "quests": RenderQuests(); break;
                 case "bag": RenderBag(); break;
                 case "drop": RenderDrop(); break;
                 case "me": RenderMe(); break;
             }
         }
 
-        void RenderBag()
+        void P(VisualElement e) => pageScroll.Add(e);
+
+        void SignInPrompt(string why)
         {
-            var slots = player != null ? $"  ·  {(int?)player["bagUsed"] ?? 0} / {(int?)player["bagSlots"] ?? 10}" : "";
-            sheet.Add(Text("YOUR BAG" + slots, "sheet-title"));
+            var box = Div("card");
+            box.Add(Text(why, "muted"));
+            var buttons = Div("stack");
+            buttons.Add(Action("Sign in", ShowSignIn, "primary"));
+            box.Add(buttons);
+            P(box);
+        }
+
+        // ---------------------------------------------------------------- quests
+
+        static bool Missing(JToken t) => t == null || t.Type == JTokenType.Null;
+
+        void RenderQuests()
+        {
+            P(Text("Quests", "h1"));
             if (!Supabase.SignedIn)
             {
-                sheet.Add(Text("Sign in to start collecting.", "muted"));
-                sheet.Add(Action("Sign in", ShowSignIn, "hex-primary"));
+                SignInPrompt("Sign in to follow quests and keep your progress.");
                 return;
             }
-            var held = bag.Where(i => (string)i["status"] != "discarded").ToList();
+
+            var active = myQuests.FirstOrDefault(q => Missing(q.At("progress").At("completedAt")));
+            if (active != null) P(ActiveQuest(active));
+            else
+            {
+                var none = Div("card");
+                none.Add(Text("You're not on a quest yet", "strong lead"));
+                none.Add(Text("Collect the first stop of a quest to start it. Quests near you are below.", "muted mt-4"));
+                P(none);
+            }
+
+            var startedIds = new HashSet<string>(myQuests.Select(q => (string)q["id"]));
+            var near = nearbyQuests.Where(q => !startedIds.Contains((string)q["id"])).ToList();
+            if (near.Count > 0)
+            {
+                P(Text("More quests nearby", "strong section-title"));
+                foreach (var q in near)
+                {
+                    var stages = q["stages"] as JArray ?? new JArray();
+                    var first = stages.FirstOrDefault()?.At("drop");
+                    var startsAt = (string)first.At("owner").At("name");
+                    P(QuestRow((string)q["name"], $"{stages.Count} stops{(startsAt != null ? $" · starts at {startsAt}" : "")}", () => ShowQuestStop(first)));
+                }
+            }
+
+            var finished = myQuests.Where(q => !Missing(q.At("progress").At("completedAt"))).ToList();
+            if (finished.Count > 0)
+            {
+                P(Text("Finished", "strong section-title"));
+                foreach (var q in finished)
+                    P(QuestRow((string)q["name"], $"{(q["stages"] as JArray)?.Count ?? 0} stops · done", null));
+            }
+        }
+
+        VisualElement ActiveQuest(JToken quest)
+        {
+            var stages = quest["stages"] as JArray ?? new JArray();
+            var done = (int?)quest.At("progress").At("stage") ?? 0;
+            var box = Div("card");
+            box.Add(Text("You're on", "strong small accent"));
+            box.Add(Text((string)quest["name"], "display mt-2"));
+            box.Add(Text($"Stop {Mathf.Min(done + 1, stages.Count)} of {stages.Count} · finish for 300 XP", "muted mt-4"));
+
+            var steps = Div("mt-16");
+            for (var i = 0; i < stages.Count; i++)
+            {
+                var stage = stages[i];
+                var drop = stage.At("drop");
+                var last = i == stages.Count - 1;
+                var row = Div("step");
+                var rail = Div("step-rail");
+                var node = Div("step-node");
+                if (i < done)
+                {
+                    node.AddToClassList("done");
+                    node.Add(new Icon("check", 16));
+                }
+                else if (last && (string)stage["rarity"] == "rare")
+                {
+                    node.AddToClassList("prize");
+                    node.Add(new Icon("star", 14));
+                }
+                if (i == done) node.AddToClassList("current");
+                rail.Add(node);
+                if (!last)
+                {
+                    var line = Div("step-line");
+                    if (i < done) line.AddToClassList("done");
+                    rail.Add(line);
+                }
+                row.Add(rail);
+                var words = Div("step-text");
+                var name = (string)drop.At("owner").At("name") ?? "A stop that isn't open now";
+                words.Add(Text(name, i == done ? "strong" : "muted"));
+                if (i == done && !Missing(drop))
+                {
+                    var d = DropInfo.From(drop);
+                    words.Add(Text(Location.HasFix ? $"Next stop · {Walk(DistanceTo(d))}" : "Next stop", "small accent mt-2"));
+                }
+                row.Add(words);
+                steps.Add(row);
+            }
+            box.Add(steps);
+
+            if (done < stages.Count)
+            {
+                var next = stages[done].At("drop");
+                var buttons = Div("stack");
+                buttons.Add(Action("Show me the way", () => ShowQuestStop(next), "primary"));
+                box.Add(buttons);
+            }
+            return box;
+        }
+
+        VisualElement QuestRow(string name, string detail, Action tapped)
+        {
+            var row = Div("list-row");
+            var words = Div("grow");
+            words.Add(Text(name, "strong"));
+            words.Add(Text(detail, "muted small mt-2"));
+            row.Add(words);
+            if (tapped != null)
+            {
+                row.Add(new Icon("chevron", 20));
+                row.AddManipulator(new Clickable(tapped));
+            }
+            return row;
+        }
+
+        void ShowQuestStop(JToken drop)
+        {
+            if (Missing(drop))
+            {
+                ShowToast("That stop isn't open right now.");
+                return;
+            }
+            var d = DropInfo.From(drop);
+            ClosePanel();
+            SelectDrop(d);
+            _ = WalkTo(d);
+        }
+
+        // ---------------------------------------------------------------- bag
+
+        void RenderBag()
+        {
+            var used = (int?)player?["bagUsed"] ?? bag.Count(i => (string)i["status"] == "held");
+            var slots = (int?)player?["bagSlots"] ?? 10;
+            var head = Div("row");
+            head.Add(Text("Your bag", "h1 grow"));
+            if (Supabase.SignedIn)
+            {
+                var right = new VisualElement();
+                right.style.alignItems = Align.FlexEnd;
+                right.Add(Text($"{used} of {slots} spaces", "strong small"));
+                var dots = Div("dots");
+                for (var i = 0; i < slots && i < 20; i++) dots.Add(Div(i < used ? "dot" : "dot empty"));
+                right.Add(dots);
+                head.Add(right);
+            }
+            P(head);
+            if (!Supabase.SignedIn)
+            {
+                SignInPrompt("Sign in to start collecting.");
+                return;
+            }
+
+            var segments = Div("segments");
+            foreach (var (id, label) in new[] { ("all", "All"), ("offer", "Offers"), ("object", "Objects") })
+            {
+                var s = new Tap(label, () => { bagFilter = id; RenderPanel(); });
+                s.AddToClassList("segment");
+                s.EnableInClassList("selected", bagFilter == id);
+                segments.Add(s);
+            }
+            P(segments);
+
+            var held = bag.Where(i => (string)i["status"] != "discarded")
+                .Where(i => bagFilter == "all" || (bagFilter == "offer" ? (string)i["kind"] == "offer" : (string)i["kind"] != "offer"))
+                .ToList();
             if (held.Count == 0)
             {
-                sheet.Add(Text("Nothing yet. Walk to a gem on the map and capture it.", "muted"));
-                return;
+                var empty = Div("card");
+                empty.Add(Text(bag.Count == 0 ? "Nothing yet. Walk to something on the map and capture it." : "Nothing here.", "muted"));
+                P(empty);
             }
-            selectedItem ??= held[0];
-            if (!held.Contains(selectedItem)) selectedItem = held[0];
+            else
+            {
+                var grid = Div("grid");
+                foreach (var item in held) grid.Add(BagTile(item));
+                P(grid);
+            }
+            if (slots - used > 0) P(Text(slots - used == 1 ? "Room for 1 more find" : $"Room for {slots - used} more finds", "room"));
+        }
+
+        VisualElement BagTile(JToken item)
+        {
+            var kind = (string)item["kind"];
+            var rarity = (string)item["rarity"];
+            var drop = item["drop"];
+            var status = (string)item["status"];
+            var tile = Div("tile");
+            var inner = Div("tile-inner");
+            var art = Div("tile-art " + RarityClass("thumb", kind, rarity));
+            art.Add(new Icon(Icon.For(kind, (string)drop.At("objectId")), 48));
+            var badge = Text(status == "redeemed" ? "Redeemed" : status == "dropped" ? "On the map"
+                : kind == "offer" ? Words.Capital(rarity ?? "common") : kind == "message" ? "Message" : "3D object",
+                "tile-badge " + RarityClass("chip", kind, rarity));
+            art.Add(badge);
+            inner.Add(art);
+            inner.Add(Text((string)item["title"], "strong tile-name"));
+            inner.Add(Text((string)drop.At("owner").At("name") ?? "", "muted small tile-sub one-line"));
+            tile.Add(inner);
+            tile.AddManipulator(new Clickable(() => ShowItem(item)));
+            return tile;
+        }
+
+        /// <summary>One item from the bag, turning in 3D, with what you can do with it.</summary>
+        void ShowItem(JToken item)
+        {
+            var box = Overlay("at-bottom");
+            var overlay = box.parent;
+            void Close()
+            {
+                overlay.RemoveFromHierarchy();
+                Preview.SetVisible(false);
+            }
 
             var preview = Div("preview");
             preview.style.backgroundImage = new StyleBackground(Background.FromRenderTexture(Preview.Texture));
-            sheet.Add(preview);
-            Preview.Show(selectedItem["drop"]);
+            box.Add(preview);
+            Preview.Show(item["drop"]);
+            Preview.SetVisible(true);
 
-            var actions = Div("buttons-row");
-            var kind = (string)selectedItem["kind"];
-            var status = (string)selectedItem["status"];
-            sheet.Add(Text((string)selectedItem["title"], "title"));
-            var savings = (string)selectedItem["drop"].At("offer").At("savings");
-            if (savings != null) sheet.Add(Text(savings, "savings"));
-            var offer = selectedItem["drop"].At("offer");
-            var worth = Words.Value((int?)selectedItem["valueNowCents"] ?? -1, (int?)offer.At("decayPercent") ?? 0, (int?)offer.At("decayDays") ?? 7);
-            if (worth != null) sheet.Add(Text(worth, "muted"));
+            var kind = (string)item["kind"];
+            var status = (string)item["status"];
+            var offer = item["drop"].At("offer");
+            var chip = Chip(kind, (string)item["rarity"]);
+            chip.AddToClassList("mt-16");
+            box.Add(chip);
+            box.Add(Text((string)item["title"], "display"));
+            var savings = (string)offer.At("savings");
+            if (savings != null) box.Add(Text(savings, "strong lead mt-8"));
+            var worth = Words.Value((int?)item["valueNowCents"] ?? -1, (int?)offer.At("decayPercent") ?? 0, (int?)offer.At("decayDays") ?? 7);
+            if (worth != null) box.Add(Text(worth, "muted mt-4"));
+
+            var actions = Div("stack mt-4");
             if (status == "held")
             {
-                var item = selectedItem;
-                if (kind == "offer") actions.Add(Action("Redeem", () => _ = Redeem(item), "hex-primary"));
-                actions.Add(Action("View in AR", () => ViewItemInAr(item), "hex-secondary"));
-                if ((bool?)item["tradeable"] ?? true) actions.Add(Action("Leave here", () => _ = LeaveHere(item), "hex-secondary"));
-                actions.Add(Action("Throw away", () => Confirm($"Throw away {(string)item["title"]}?", () => _ = ThrowAway(item)), "link"));
+                if (kind == "offer") actions.Add(Action("Redeem", () => { Close(); _ = Redeem(item); }, "primary"));
+                actions.Add(Action("View in AR", () => { Close(); ViewItemInAr(item); }, "secondary"));
+                if ((bool?)item["tradeable"] ?? true) actions.Add(Action("Leave it here for someone", () => { Close(); _ = LeaveHere(item); }, "secondary"));
+                actions.Add(Action("Throw away", () => { Close(); Confirm($"Throw away {(string)item["title"]}?", () => _ = ThrowAway(item)); }, "danger"));
             }
-            else sheet.Add(Text(status == "redeemed" ? "Redeemed." : "Left on the map for someone else.", "muted"));
-            sheet.Add(actions);
-
-            var list = new ScrollView();
-            list.AddToClassList("list");
-            foreach (var item in held)
-            {
-                var row = Div("item-row");
-                row.EnableInClassList("selected", item == selectedItem);
-                var dot = Div("gem-dot");
-                dot.style.backgroundColor = Gem.ColourFor(new DropInfo { Type = (string)item["kind"], Rarity = (string)item["rarity"] });
-                row.Add(dot);
-                var info = Div("grow");
-                info.Add(Text((string)item["title"], "item-title"));
-                var words = (string)item["kind"] == "offer" ? $"{Words.Capital((string)item["rarity"] ?? "")} offer".Trim() : Words.Capital((string)item["kind"]);
-                if ((string)item["status"] == "redeemed") words += " · redeemed";
-                if ((string)item["status"] == "dropped") words += " · on the map";
-                info.Add(Text(words, "muted"));
-                row.Add(info);
-                var chosen = item;
-                row.RegisterCallback<ClickEvent>(_ => { selectedItem = chosen; RenderPanel(); });
-                list.Add(row);
-            }
-            sheet.Add(list);
+            else box.Add(Text(status == "redeemed" ? "Redeemed." : "Left on the map for someone else.", "muted mt-12"));
+            actions.Add(Action("Close", Close, "link"));
+            box.Add(actions);
         }
+
+        // ---------------------------------------------------------------- leave a message
 
         void RenderDrop()
         {
-            sheet.Add(Text("DROP A MESSAGE", "sheet-title"));
+            P(Text("Leave a message", "h1"));
             if (!Supabase.SignedIn)
             {
-                sheet.Add(Text("Sign in to leave messages for people who come by.", "muted"));
-                sheet.Add(Action("Sign in", ShowSignIn, "hex-primary"));
+                SignInPrompt("Sign in to leave messages for people who come by.");
                 return;
             }
-            sheet.Add(Text("It goes right where you're standing, for anyone who comes by.", "muted"));
+            P(Text("It goes right where you're standing, for anyone who comes by.", "muted mt-8"));
             var title = new TextField("Title") { maxLength = 70 };
             var message = new TextField("Message") { multiline = true, maxLength = 400 };
             message.AddToClassList("multiline");
-            sheet.Add(title);
-            sheet.Add(message);
+            P(title);
+            P(message);
+            P(Text("How it looks", "strong small mt-16"));
             var chosen = "note";
-            var looks = Div("looks");
+            var looks = Div("looks-picker");
             foreach (var (id, name) in Looks)
             {
-                var b = Action(name, null, "look");
+                var b = new Tap(name, null);
+                b.AddToClassList("look-chip");
                 b.clicked += () =>
                 {
                     chosen = id;
@@ -645,10 +1195,13 @@ namespace Hololoco
                 b.EnableInClassList("selected", id == chosen);
                 looks.Add(b);
             }
-            sheet.Add(looks);
-            var error = Text("", "error");
-            sheet.Add(Action("Drop it here", () => _ = PostMessage(title.value, message.value, chosen, error), "hex-primary"));
-            sheet.Add(error);
+            P(looks);
+            var error = Text("", "error mt-8");
+            var buttons = Div("stack");
+            buttons.Add(Action("Drop it here", () => _ = PostMessage(title.value, message.value, chosen, error), "primary"));
+            buttons.Add(Action("Cancel", ClosePanel, "link"));
+            P(buttons);
+            P(error);
         }
 
         async Task PostMessage(string title, string message, string look, Label error)
@@ -674,7 +1227,7 @@ namespace Hololoco
             try
             {
                 await Supabase.Rpc("save_drop", new JObject { ["payload"] = payload });
-                ShowToast("Dropped! People nearby can find it now.");
+                ShowToast("Dropped. People nearby can find it now.");
                 ClosePanel();
                 lastFetch = -999f;
             }
@@ -701,64 +1254,95 @@ namespace Hololoco
 #endif
         }
 
+        // ---------------------------------------------------------------- me
+
         void RenderMe()
         {
-            sheet.Add(Text("YOU", "sheet-title"));
-            if (!Supabase.SignedIn)
-            {
-                sheet.Add(Text("Sign in to capture drops, keep them, and redeem offers.", "muted"));
-                sheet.Add(Action("Sign in", ShowSignIn, "hex-primary"));
-                return;
-            }
-            if (player != null)
-            {
-                var level = (int?)player["level"] ?? 1;
-                var xp = (int?)player["xp"] ?? 0;
-                var from = (int?)player["levelXp"] ?? 0;
-                var to = (int?)player["nextLevelXp"] ?? 100;
-                sheet.Add(Text($"Level {level}", "big"));
-                var back = Div("bar-back");
-                var fill = Div("bar-fill");
-                fill.style.width = Length.Percent(Mathf.Clamp01((xp - from) / (float)Mathf.Max(to - from, 1)) * 100f);
-                back.Add(fill);
-                sheet.Add(back);
-                sheet.Add(Text($"{xp} XP · {to - xp} to level {level + 1}", "muted"));
-                sheet.Add(Text($"{(int?)player["captures"] ?? 0} captured · {(int?)player["questsDone"] ?? 0} quests · {(int?)player["points"] ?? 0} points", "muted"));
+            var profile = Div("profile");
+            var avatar = Text(Initial(), "avatar avatar-big");
+            profile.Add(avatar);
+            var who = Div("grow ml-12");
+            var handle = (string)player?["handle"];
+            who.Add(Text(!string.IsNullOrEmpty(handle) ? "@" + handle : Supabase.SignedIn ? "You" : "Not signed in", "display"));
+            if (player != null) who.Add(Text($"Level {(int?)player["level"] ?? 1} · {(int?)player["xp"] ?? 0} XP", "muted mt-2"));
+            profile.Add(who);
+            P(profile);
 
-                var handle = new TextField("Your name for trading") { value = (string)player["handle"] ?? "" };
-                sheet.Add(handle);
-                sheet.Add(Action("Save name", async () =>
+            if (!Supabase.SignedIn) SignInPrompt("Sign in to capture drops, keep them, and redeem offers.");
+            else if (player != null)
+            {
+                var xp = (int?)player["xp"] ?? 0;
+                var to = (int?)player["nextLevelXp"] ?? 100;
+                var stats = Div("stats on-page");
+                Stat(stats, $"{Mathf.Max(to - xp, 0)}", $"XP to level {((int?)player["level"] ?? 1) + 1}");
+                Stat(stats, $"{(int?)player["points"] ?? 0}", "points");
+                Stat(stats, $"{(int?)player["captures"] ?? 0}", "collected");
+                P(stats);
+                var bar = Div("progress mt-12");
+                var fill = Div("progress-fill");
+                fill.style.width = Length.Percent(LevelProgress() * 100f);
+                bar.Add(fill);
+                P(bar);
+            }
+
+            // The look: one card per skin.
+            P(Text("Look", "strong section-title"));
+            var looks = Div("looks-row");
+            foreach (var skin in Skin.All)
+            {
+                var choice = Div("look");
+                choice.EnableInClassList("selected", skin == Skin.Current);
+                choice.Add(Text(skin.Name, "strong small"));
+                var swatches = Div("swatches");
+                foreach (var colour in new[] { skin.Page, skin.Accent, skin.Rare })
+                {
+                    var swatch = Div("swatch");
+                    swatch.style.backgroundColor = colour;
+                    swatches.Add(swatch);
+                }
+                choice.Add(swatches);
+                var chosen = skin;
+                choice.AddManipulator(new Clickable(() => { if (Skin.Current != chosen) Skin.Set(chosen); }));
+                looks.Add(choice);
+            }
+            P(looks);
+            P(Text(Skin.Current.Blurb, "muted small mt-8"));
+
+            P(Text("Settings", "strong section-title"));
+            P(Toggle("Tell me when I'm near a drop", "hl.alerts", null));
+            P(Toggle("3D buildings on the map", "hl.buildings", on => Map.SetBuildings(on)));
+
+            if (Supabase.SignedIn && player != null)
+            {
+                P(Text("Trading name", "strong section-title"));
+                var name = new TextField("People trade with you by this name") { value = (string)player["handle"] ?? "" };
+                P(name);
+                var save = Div("stack");
+                save.Add(Action("Save name", async () =>
                 {
                     try
                     {
-                        if (await Supabase.Rpc("set_handle", new JObject { ["handle"] = handle.value }) is JObject p) SetPlayer(p);
+                        if (await Supabase.Rpc("set_handle", new JObject { ["handle"] = name.value }) is JObject p) SetPlayer(p);
                         ShowToast("Saved.");
                     }
                     catch (Exception e) { ShowToast(Words.For(e)); }
-                }, "hex-secondary"));
+                }, "secondary"));
+                P(save);
+                P(Text($"Signed in as {Supabase.Email}", "muted small mt-24"));
+                var signOut = Div("stack");
+                signOut.Add(Action("Sign out", () =>
+                {
+                    Supabase.SignOut();
+                    player = null;
+                    bag = new JArray();
+                    myQuests = new JArray();
+                    levelText.text = "Level 1";
+                    levelFill.style.width = 0;
+                    avatarLetter.text = "?";
+                    RenderPanel();
+                }, "link"));
+                P(signOut);
             }
-            sheet.Add(Toggle("Tell me when I'm near a drop", "hl.alerts", null));
-            sheet.Add(Toggle("3D buildings on the map", "hl.buildings", on => Map.SetBuildings(on)));
-            var game = new UnityEngine.UIElements.Toggle("Dark game map") { value = Map.GameMap };
-            game.AddToClassList("switch");
-            game.RegisterValueChangedCallback(e => SetGameMap(e.newValue));
-            sheet.Add(game);
-            sheet.Add(Text($"Signed in as {Supabase.Email}", "muted"));
-            sheet.Add(Action("Sign out", () =>
-            {
-                Supabase.SignOut();
-                player = null;
-                bag = new JArray();
-                chip.style.display = DisplayStyle.None;
-                RenderPanel();
-            }, "link"));
-        }
-
-        void SetGameMap(bool on)
-        {
-            PlayerPrefs.SetInt("hl.gamemap", on ? 1 : 0);
-            PlayerPrefs.Save();
-            Map.SetGameMap(on);
         }
 
         VisualElement Toggle(string label, string key, Action<bool> changed)
@@ -807,7 +1391,6 @@ namespace Hololoco
             try
             {
                 await Supabase.Rpc("discard_item", new JObject { ["item_id"] = (string)item["id"] });
-                selectedItem = null;
                 await RefreshBag();
             }
             catch (Exception e) { ShowToast(Words.For(e)); }
@@ -815,28 +1398,29 @@ namespace Hololoco
 
         // ================================================================ overlays
 
-        VisualElement Overlay(bool atTop = false)
+        VisualElement Overlay(string where = null)
         {
             var overlay = Div("overlay");
-            if (atTop) overlay.AddToClassList("at-top");
+            if (where != null) overlay.AddToClassList(where);
             var box = Div("dialog");
             overlay.Add(box);
             root.Add(overlay);
+            toast.BringToFront();
             return box;
         }
 
         void ShowSignIn()
         {
             root.Query(className: "overlay").ForEach(o => o.RemoveFromHierarchy());
-            var box = Overlay(true);
+            var box = Overlay("at-top");
             var overlay = box.parent;
-            box.Add(Text("SIGN IN TO HOLOLOCO", "sheet-title"));
-            box.Add(Text("Use the same account as the Hololoco website. We'll email you a 6-digit code.", "muted"));
+            box.Add(Text("Sign in to Hololoco", "display"));
+            box.Add(Text("Use the same account as the Hololoco website. We'll email you a 6-digit code.", "muted mt-8"));
             var email = new TextField("Email") { value = Supabase.Email, keyboardType = TouchScreenKeyboardType.EmailAddress };
             var code = new TextField("Code from the email") { keyboardType = TouchScreenKeyboardType.NumberPad };
             code.style.display = DisplayStyle.None;
-            var error = Text("", "error");
-            Button send = null, verify = null;
+            var error = Text("", "error mt-8");
+            Tap send = null, verify = null;
             send = Action("Email me a code", async () =>
             {
                 error.text = "";
@@ -847,10 +1431,12 @@ namespace Hololoco
                     code.style.display = DisplayStyle.Flex;
                     verify.style.display = DisplayStyle.Flex;
                     send.text = "Send a new code";
+                    send.RemoveFromClassList("primary");
+                    send.AddToClassList("secondary");
                 }
                 catch (Exception e) { error.text = Words.For(e); }
                 send.SetEnabled(true);
-            }, "hex-primary");
+            }, "primary");
             verify = Action("Sign in", async () =>
             {
                 error.text = "";
@@ -865,30 +1451,33 @@ namespace Hololoco
                 }
                 catch (Exception e) { error.text = Words.For(e); }
                 verify.SetEnabled(true);
-            }, "hex-primary");
+            }, "primary");
             verify.style.display = DisplayStyle.None;
             box.Add(email);
-            box.Add(send);
             box.Add(code);
-            box.Add(verify);
+            var buttons = Div("stack");
+            buttons.Add(send);
+            buttons.Add(verify);
+            buttons.Add(Action("Not now", () => overlay.RemoveFromHierarchy(), "link"));
+            box.Add(buttons);
             box.Add(error);
-            box.Add(Action("Not now", () => overlay.RemoveFromHierarchy(), "link"));
         }
 
         /// <summary>Posting needs a name shown on drops and an 18+ confirmation, as on the website.</summary>
         void ShowProfileForm(Action then)
         {
-            var box = Overlay(true);
+            var box = Overlay("at-top");
             var overlay = box.parent;
-            box.Add(Text("ONE MORE THING", "sheet-title"));
-            box.Add(Text("Before you post, choose the name shown on your drops.", "muted"));
+            box.Add(Text("One more thing", "display"));
+            box.Add(Text("Before you post, choose the name shown on your drops.", "muted mt-8"));
             var name = new TextField("Name shown on your drops") { maxLength = 40 };
             var adult = new UnityEngine.UIElements.Toggle("I'm 18 or older");
             adult.AddToClassList("switch");
-            var error = Text("", "error");
+            var error = Text("", "error mt-8");
             box.Add(name);
             box.Add(adult);
-            box.Add(Action("Save", async () =>
+            var buttons = Div("stack");
+            buttons.Add(Action("Save", async () =>
             {
                 if (string.IsNullOrWhiteSpace(name.value) || !adult.value)
                 {
@@ -902,34 +1491,45 @@ namespace Hololoco
                     then();
                 }
                 catch (Exception e) { error.text = Words.For(e); }
-            }, "hex-primary"));
+            }, "primary"));
+            buttons.Add(Action("Cancel", () => overlay.RemoveFromHierarchy(), "link"));
+            box.Add(buttons);
             box.Add(error);
-            box.Add(Action("Cancel", () => overlay.RemoveFromHierarchy(), "link"));
         }
 
         /// <summary>The code to show at the counter, until the business confirms it or it runs out.</summary>
         void ShowRedeem(JToken item, JToken answer)
         {
-            var box = Overlay();
+            var box = Overlay("at-bottom");
             var overlay = box.parent;
-            box.Add(Text((string)item["drop"].At("offer").At("savings") ?? (string)item["title"], "title"));
-            box.Add(Text($"Show this code at {(string)answer["business"]}. They type it in to redeem it.", "muted"));
+            box.Add(Text("Show this at the counter", "strong small accent center"));
+            box.Add(Text((string)item["drop"].At("offer").At("savings") ?? (string)item["title"], "display center mt-8"));
+            box.Add(Text($"at {(string)answer["business"]}", "muted center mt-2"));
             var code = (string)answer["code"];
             box.Add(Text($"{code.Substring(0, 3)} {code.Substring(3)}", "code"));
+            var bar = Div("progress");
+            var fill = Div("progress-fill");
+            bar.Add(fill);
+            box.Add(bar);
             var expires = DateTime.Parse((string)answer["expiresAt"]).ToUniversalTime();
-            var left = Text("", "muted");
+            var left = Text("", "muted center mt-8");
             box.Add(left);
+            box.Add(Text("They type the code at hololoco.com/redeem. It leaves your bag once they confirm.", "muted small center mt-12"));
             var terms = (string)item["drop"].At("offer").At("terms");
-            if (!string.IsNullOrEmpty(terms)) box.Add(Text("Terms: " + terms, "muted"));
-            box.Add(Action("Close", () => overlay.RemoveFromHierarchy(), "hex-secondary"));
+            if (!string.IsNullOrEmpty(terms)) box.Add(Text("Terms: " + terms, "muted small center mt-8"));
+            var buttons = Div("stack");
+            buttons.Add(Action("Close", () => overlay.RemoveFromHierarchy(), "secondary"));
+            box.Add(buttons);
 
             var itemId = (string)item["id"];
+            var total = Mathf.Max((float)(expires - DateTime.UtcNow).TotalSeconds, 1f);
             var done = false;
             overlay.schedule.Execute(async () =>
             {
                 if (done) return;
                 var remaining = expires - DateTime.UtcNow;
                 left.text = remaining.TotalSeconds > 0 ? $"Good for {remaining.Minutes}:{remaining.Seconds:00}" : "This code has run out. Close and tap Redeem again.";
+                fill.style.width = Length.Percent(Mathf.Clamp01((float)remaining.TotalSeconds / total) * 100f);
                 if ((int)remaining.TotalSeconds % 4 != 0) return;
                 try
                 {
@@ -937,9 +1537,11 @@ namespace Hololoco
                     if ((string)items?.FirstOrDefault(i => (string)i["id"] == itemId).At("status") != "redeemed") return;
                     done = true;
                     box.Clear();
-                    box.Add(Text("REDEEMED!", "big"));
-                    box.Add(Text("Enjoy it.", "muted"));
-                    box.Add(Action("Close", () => { overlay.RemoveFromHierarchy(); _ = RefreshBag(); }, "hex-primary"));
+                    box.Add(Text("Redeemed", "big accent center"));
+                    box.Add(Text("Enjoy it.", "muted center mt-8"));
+                    var close = Div("stack");
+                    close.Add(Action("Close", () => { overlay.RemoveFromHierarchy(); _ = RefreshBag(); }, "primary"));
+                    box.Add(close);
                 }
                 catch (Exception)
                 {
@@ -952,41 +1554,105 @@ namespace Hololoco
         {
             var box = Overlay();
             var overlay = box.parent;
-            box.Add(Text(question, "title"));
-            box.Add(Action("Yes", () => { overlay.RemoveFromHierarchy(); yes(); }, "hex-primary"));
-            box.Add(Action("No", () => overlay.RemoveFromHierarchy(), "link"));
+            box.Add(Text(question, "display"));
+            var buttons = Div("buttons");
+            buttons.Add(Action("No", () => overlay.RemoveFromHierarchy(), "secondary"));
+            buttons.Add(Action("Yes", () => { overlay.RemoveFromHierarchy(); yes(); }, "primary"));
+            box.Add(buttons);
         }
 
         void ShowToast(string text)
         {
             toast.text = text;
             toast.style.display = DisplayStyle.Flex;
+            toast.BringToFront();
             toastUntil = Time.time + 4f;
         }
 
         // ================================================================ small helpers
 
-        static VisualElement Div(string cls)
+        /// <summary>A tappable label: the app's buttons, free of the default theme's button styles.</summary>
+        class Tap : Label
+        {
+            public event Action clicked;
+
+            public Tap(string text, Action onClick) : base(text)
+            {
+                if (onClick != null) clicked += onClick;
+                this.AddManipulator(new Clickable(() => clicked?.Invoke()));
+            }
+        }
+
+        static VisualElement Div(string classes = null)
         {
             var element = new VisualElement();
-            element.AddToClassList(cls);
+            AddClasses(element, classes);
             return element;
         }
 
-        static Label Text(string text, string cls = null)
+        static void AddClasses(VisualElement element, string classes)
+        {
+            if (classes == null) return;
+            foreach (var c in classes.Split(' ', StringSplitOptions.RemoveEmptyEntries)) element.AddToClassList(c);
+        }
+
+        static Label Text(string text, string classes = null)
         {
             var label = new Label(text);
             label.AddToClassList("text");
-            if (cls != null) label.AddToClassList(cls);
+            AddClasses(label, classes);
             return label;
         }
 
-        static Button Action(string text, Action onClick, string cls = null)
+        static Tap Action(string text, Action onClick, string classes = null)
         {
-            var button = onClick != null ? new Button(onClick) { text = text } : new Button { text = text };
+            var button = new Tap(text, onClick);
             button.AddToClassList("action");
-            if (cls != null) button.AddToClassList(cls);
+            AddClasses(button, classes);
             return button;
+        }
+
+        static VisualElement Round(string icon, Action onClick)
+        {
+            var button = Div("round");
+            button.Add(new Icon(icon, 22));
+            button.AddManipulator(new Clickable(onClick));
+            return button;
+        }
+
+        static string RarityClass(string prefix, string type, string rarity) =>
+            type == "offer" ? $"{prefix}-{(rarity is "rare" or "uncommon" ? rarity : "common")}" : $"{prefix}-plain";
+
+        static VisualElement Thumb(string type, string rarity, string objectId, bool big = false)
+        {
+            var thumb = Div("thumb " + RarityClass("thumb", type, rarity) + (big ? " thumb-big" : ""));
+            thumb.Add(new Icon(Icon.For(type, objectId), big ? 42 : 34));
+            return thumb;
+        }
+
+        static Label Chip(string type, string rarity)
+        {
+            var words = type == "offer" ? Words.Capital(rarity ?? "common") : type == "message" ? "Message" : "3D object";
+            var chip = Text(words, "chip " + RarityClass("chip", type, rarity));
+            return chip;
+        }
+
+        static Label Stat(VisualElement stats, string value, string label)
+        {
+            var box = Div("stat");
+            var number = Text(value, "stat-value");
+            box.Add(number);
+            box.Add(Text(label, "muted small"));
+            stats.Add(box);
+            return number;
+        }
+
+        static VisualElement Notice(string icon, string words, string tone)
+        {
+            var notice = Div("notice notice-" + tone);
+            notice.Add(new Icon(icon, 20));
+            notice.Add(Text(words, "strong"));
+            return notice;
         }
     }
 }

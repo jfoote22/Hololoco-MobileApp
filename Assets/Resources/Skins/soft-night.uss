@@ -1,0 +1,67 @@
+/* Soft night: calm and dark. Deep navy, a gentle aqua for actions, lilac for
+   rare things, very round shapes, Plus Jakarta Sans, and a bar that floats. */
+
+.app {
+    --bg: #0b1020;
+    --surface: #171f36;
+    --surface-2: #1c2440;
+    --float: rgba(20, 27, 48, 0.94);
+    --float-line: #2b3555;
+    --card-line: #232c47;
+    --nav-bg: rgba(20, 27, 48, 0.96);
+    --nav-pill: #143a4a;
+    --line: #2b3555;
+    --line-strong: #3a4566;
+    --track: #2b3555;
+    --ink: #f3f6ff;
+    --muted: #aab4d0;
+    --accent: #7fe3f2;
+    --on-accent: #062630;
+    --accent-soft: #143a4a;
+    --warm: #ffd18a;
+    --warm-soft: #3d2f14;
+    --danger: #ff8a80;
+    --scrim: rgba(4, 7, 16, 0.72);
+
+    --common: #cdd5e4;
+    --common-soft: #262f48;
+    --common-ink: #cdd5e4;
+    --uncommon: #86e3b0;
+    --uncommon-soft: #163a2c;
+    --uncommon-ink: #86e3b0;
+    --rare: #f7a8f0;
+    --rare-soft: #3d1d42;
+    --rare-ink: #f7a8f0;
+    --on-rare: #2a0d2b;
+
+    --radius-card: 22px;
+    --radius-sheet: 32px;
+    --radius-button: 28px;
+    --radius-tile: 18px;
+    --radius-thumb: 18px;
+    --radius-chip: 12px;
+    --pin-bg: #1c2440;
+    --nav-clear: 108px;
+    --page-bottom: 120px;
+}
+
+.app, .unity-text-element { -unity-font-definition: resource("Fonts/PlusJakartaSans-Medium"); }
+.strong, .lead, .action, .chip, .nav-label, .segment, .look-chip, .tile-badge, .count-pill, .toast, .switch > .unity-base-field__label { -unity-font-definition: resource("Fonts/PlusJakartaSans-Bold"); }
+.display, .h1, .title, .big, .code, .stat-value, .avatar { -unity-font-definition: resource("Fonts/PlusJakartaSans-ExtraBold"); }
+
+/* The bar floats above the map with rounded ends; Scan sits inside it. */
+.nav {
+    left: 16px;
+    right: 16px;
+    bottom: 20px;
+    height: 74px;
+    padding: 6px;
+    align-items: center;
+    border-width: 1px;
+    border-color: var(--float-line);
+    border-radius: 26px;
+}
+
+.nav-item { height: 62px; justify-content: center; }
+.scan-disc { width: 54px; height: 54px; border-radius: 27px; border-width: 0; margin-bottom: 0; }
+.nav-scan .nav-label { display: none; }

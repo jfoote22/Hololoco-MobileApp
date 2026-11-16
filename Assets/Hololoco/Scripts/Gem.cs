@@ -17,18 +17,18 @@ namespace Hololoco
 
         static Mesh mesh;
 
-        /// <summary>Colour for a rarity, or for a drop that isn't an offer.</summary>
+        /// <summary>Colour for a rarity, or for a drop that isn't an offer, in the current skin.</summary>
         public static Color ColourFor(DropInfo drop) => drop.Type switch
         {
-            "offer" => drop.Rarity switch
-            {
-                "rare" => new Color(0.78f, 0.48f, 1f),
-                "uncommon" => new Color(0.3f, 0.9f, 0.6f),
-                _ => new Color(0.55f, 0.83f, 1f),
-            },
-            "message" => new Color(0.95f, 0.95f, 1f),
-            _ => new Color(1f, 0.8f, 0.4f),
+            "offer" => Skin.Current.RarityColour(drop.Rarity),
+            "message" => Skin.Current.Message,
+            _ => Skin.Current.Object,
         };
+
+        public void SetColour(Color colour)
+        {
+            if (material != null) material.SetColor("_Color", colour);
+        }
 
         static string PatternFor(DropInfo drop) => drop.Rarity switch
         {

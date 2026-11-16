@@ -281,6 +281,12 @@ public static class HololocoSetup
         pose.rotationInput = new InputActionProperty(new InputAction("Rotation", binding: "<HandheldARInputDevice>/deviceRotation"));
         origin.Camera = arCamera;
         origin.CameraFloorOffsetObject = offset;
+        // Ground finding for encounters: horizontal planes, raycasts into them, and anchors
+        // that keep a drop locked to its spot.
+        var planes = originObject.AddComponent<ARPlaneManager>();
+        planes.requestedDetectionMode = UnityEngine.XR.ARSubsystems.PlaneDetectionMode.Horizontal;
+        var raycasts = originObject.AddComponent<ARRaycastManager>();
+        originObject.AddComponent<ARAnchorManager>();
         // No ARCore Extensions (Geospatial) in the scene: encounters appear in front of the
         // player, and ARCore Extensions crashes when the AR session starts switched off.
         // The precise "explore" mode (Scripts/Later) will bring it back, enabled with the session.
@@ -302,6 +308,8 @@ public static class HololocoSetup
         var encounter = new GameObject("Encounter").AddComponent<Encounter>();
         encounter.Camera = arCamera;
         encounter.Session = session;
+        encounter.Raycasts = raycasts;
+        encounter.Planes = planes;
 
         var preview = new GameObject("Preview").AddComponent<Preview>();
 

@@ -1,0 +1,61 @@
+/* Holo HUD: sharp and technical. Near-black, hologram cyan, magenta for rare
+   things, small square corners, Oxanium headings and mono labels. */
+
+.app {
+    --bg: #080b10;
+    --surface: #0f151c;
+    --surface-2: #0b1016;
+    --float: rgba(15, 21, 28, 0.9);
+    --float-line: #233140;
+    --card-line: #233140;
+    --nav-bg: rgba(15, 21, 28, 0.95);
+    --nav-pill: rgba(0, 0, 0, 0);
+    --line: #233140;
+    --line-strong: #566b7d;
+    --track: #233140;
+    --ink: #e8f0f5;
+    --muted: #93a6b4;
+    --accent: #3fe0ff;
+    --on-accent: #03141a;
+    --accent-soft: #06303a;
+    --warm: #ffb547;
+    --warm-soft: #33240a;
+    --danger: #ff6b5e;
+    --scrim: rgba(4, 8, 16, 0.78);
+
+    --common: #a9b8c4;
+    --common-soft: #1b242d;
+    --common-ink: #a9b8c4;
+    --uncommon: #4be38c;
+    --uncommon-soft: #0a2e1c;
+    --uncommon-ink: #4be38c;
+    --rare: #ff5cb8;
+    --rare-soft: #3a0b26;
+    --rare-ink: #ff5cb8;
+    --on-rare: #1a0410;
+
+    --radius-card: 8px;
+    --radius-sheet: 12px;
+    --radius-button: 4px;
+    --radius-tile: 6px;
+    --radius-thumb: 6px;
+    --radius-chip: 2px;
+    --pin-bg: #0f151c;
+    --nav-clear: 98px;
+    --page-bottom: 112px;
+}
+
+.app, .unity-text-element { -unity-font-definition: resource("Fonts/Manrope-Medium"); }
+.strong, .lead, .action, .nav-label, .segment, .look-chip, .count-pill, .toast, .switch > .unity-base-field__label { -unity-font-definition: resource("Fonts/Manrope-Bold"); }
+.display, .h1, .title, .big, .stat-value, .avatar { -unity-font-definition: resource("Fonts/Oxanium-SemiBold"); }
+.label, .chip, .tile-badge, .code { -unity-font-definition: resource("Fonts/MartianMono-Medium"); }
+.label, .chip, .tile-badge, .nav-label { letter-spacing: 1px; }
+
+.level-pill, .count-pill, .round, .ar-chip, .status { border-radius: 4px; }
+.avatar { border-radius: 2px; }
+.scan-disc { border-radius: 6px; }
+.nav-pill { border-radius: 2px; }
+.segment, .look-chip { border-radius: 2px; }
+.toast { border-radius: 4px; }
+.pin-disc { border-radius: 6px; }
+.pin-label { border-radius: 2px; }
