@@ -1,0 +1,31 @@
+# Unity's generated folders
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+*.csproj
+*.sln
+*.suo
+*.user
+*.pidb
+*.booproj
+*.apk
+*.aab
+*.unitypackage
+.vs/
+.idea/
+
+# The Supabase address and public key: copied from the website's .env.local (see README).
+/Assets/Resources/hololoco-config.json
+/Assets/Resources/hololoco-config.json.meta
+
+# Written by every build, with the ARCore API key when there is one (from F:\Hololoco\secrets).
+/ProjectSettings/ARCoreExtensionsProjectSettings.json
+
+# Unity's scratch folder
+/.utmp/
