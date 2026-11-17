@@ -3,7 +3,9 @@
 //
 //   Map (home)  a tilted 3D map with your avatar and a pin for each drop nearby,
 //               cards for the closest ones, and a drop's card when you tap one:
-//               "Open in AR" when you're close, or "Walk there".
+//               "Open in AR" when you're close, or "Walk there". Filters along the
+//               top choose the pins: All, Events (games, shows and giveaways around
+//               town that Hololoco found), Businesses, Quests, or Mine.
 //   Quests      the quest you're on, stop by stop, and quests starting nearby.
 //   Scan        opens AR on the closest drop you can reach.
 //   AR          the item's own 3D model, standing on the ground and staying put while
@@ -57,6 +59,28 @@ namespace Hololoco
         float toastUntil, bannerUntil;
 
         List<DropInfo> nearby = new();
+        /// <summary>Approved events and giveaways across town (app_found_nearby), farther than the player can see.</summary>
+        List<DropInfo> aroundTown = new();
+        double foundLat = double.NaN, foundLng;
+        float foundAt = -999f;
+        bool fetchingFound;
+
+        /// <summary>What the map shows: everything, or only events, business drops, quests or your own.</summary>
+        static readonly (string id, string label)[] Filters =
+        {
+            ("all", "All"), ("events", "Events"), ("business", "Businesses"), ("quests", "Quests"), ("mine", "Mine"),
+        };
+        string pinFilter = "all";
+        ScrollView filters;
+
+        /// <summary>Under Events: how far, and what kind. Null and 0 mean any.</summary>
+        string eventType;
+        float eventWithin;
+        static readonly float[] EventDistances = { 0f, 1000f, 3000f, 10000f };
+        ScrollView eventFilters;
+
+        /// <summary>What's at each spot on the map: drops within about 10 m share a pin.</summary>
+        readonly Dictionary<string, List<DropInfo>> spots = new();
         JArray bag = new();
         JArray myQuests = new();
         JArray nearbyQuests = new();
@@ -141,6 +165,34 @@ namespace Hololoco
             compassIcon = compass.Q<Icon>();
             top.Add(compass);
             root.Add(top);
+
+            // Which pins the map shows. The choice is kept between visits.
+            pinFilter = PlayerPrefs.GetString("hl.pins", "all");
+            if (Filters.All(f => f.id != pinFilter)) pinFilter = "all";
+            filters = new ScrollView(ScrollViewMode.Horizontal)
+            {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Hidden,
+            };
+            filters.AddToClassList("filters");
+            foreach (var (id, label) in Filters)
+            {
+                var chip = new Tap(label, () => SetFilter(id));
+                chip.AddToClassList("filter");
+                chip.name = id;
+                filters.Add(chip);
+            }
+            MarkFilter();
+            root.Add(filters);
+
+            eventFilters = new ScrollView(ScrollViewMode.Horizontal)
+            {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Hidden,
+            };
+            eventFilters.AddToClassList("filters");
+            eventFilters.AddToClassList("subfilters");
+            root.Add(eventFilters);
 
             tools = Div("tools");
             tools.Add(Round("recenter", () => { ClosePanel(); Map.Recenter(); }));
@@ -264,6 +316,9 @@ namespace Hololoco
             var cardOpen = card.style.display == DisplayStyle.Flex;
             var mapClear = onMap && panel == null;
             Show(top, mapClear);
+            Show(filters, mapClear);
+            Show(eventFilters, mapClear && pinFilter == "events");
+            root.EnableInClassList("with-subfilters", mapClear && pinFilter == "events");
             Show(pinLayer, mapClear);
             Show(tools, mapClear && !cardOpen);
             Show(nearbyStrip, mapClear && !cardOpen && nearbyStrip.childCount > 0);
@@ -370,6 +425,8 @@ namespace Hololoco
             {
                 var moved = Geo.Distance(lastLat, lastLng, Location.Lat, Location.Lng);
                 if (!fetching && (moved > 25f || Time.time - lastFetch > 30f)) _ = RefreshNearby(Location.Lat, Location.Lng);
+                var movedFar = double.IsNaN(foundLat) ? float.MaxValue : Geo.Distance(foundLat, foundLng, Location.Lat, Location.Lng);
+                if (!fetchingFound && (movedFar > 1000f || Time.time - foundAt > 300f)) _ = RefreshFound(Location.Lat, Location.Lng);
             }
 
             if (mode == Mode.Map && card.style.display == DisplayStyle.Flex && selectedDrop != null) RenderCardDistance();
@@ -417,45 +474,125 @@ namespace Hololoco
 
         // ================================================================ pins on the map
 
-        /// <summary>One pin per drop: made, kept or removed to match what's nearby.</summary>
-        void SyncPins()
+        static string SpotKey(DropInfo d) =>
+            d.Lat.ToString("F4", System.Globalization.CultureInfo.InvariantCulture) + "," +
+            d.Lng.ToString("F4", System.Globalization.CultureInfo.InvariantCulture);
+
+        static string PlaceName(DropInfo d) =>
+            d.Found != null && !string.IsNullOrEmpty(d.Found.Venue) ? d.Found.Venue : "Here";
+
+        /// <summary>
+        /// One pin per spot: drops within about 10 m share a pin, which shows how many.
+        /// Tapping a shared pin lists everything there.
+        /// </summary>
+        void SyncPins(List<DropInfo> shown)
         {
-            var keep = new HashSet<string>();
-            foreach (var drop in nearby)
+            spots.Clear();
+            foreach (var drop in shown)
             {
-                keep.Add(drop.Id);
-                if (pins.TryGetValue(drop.Id, out var entry))
+                var key = SpotKey(drop);
+                if (!spots.TryGetValue(key, out var here)) spots[key] = here = new List<DropInfo>();
+                here.Add(drop);
+            }
+            foreach (var key in pins.Keys.Where(k => !spots.ContainsKey(k)).ToList())
+            {
+                pins[key].pin.RemoveFromHierarchy();
+                pins.Remove(key);
+            }
+            foreach (var (key, here) in spots)
+            {
+                var first = here[0];
+                var count = here.Count;
+                var label = count == 1 ? first.Title : $"{PlaceName(first)} · {count}";
+                if (pins.TryGetValue(key, out var entry))
                 {
-                    pins[drop.Id] = (entry.pin, drop);
-                    continue;
+                    // The same pin while it says the same thing; drawn again when it changes.
+                    if (entry.pin.userData as string == label) { pins[key] = (entry.pin, first); continue; }
+                    entry.pin.RemoveFromHierarchy();
+                    pins.Remove(key);
                 }
-                var pin = Div("pin " + RarityClass("pin", drop.Type, drop.Rarity));
-                if (drop.Mine) pin.AddToClassList("mine");
-                var label = Text(drop.Title, "pin-label strong one-line");
-                label.pickingMode = PickingMode.Ignore;
-                pin.Add(label);
+                var pin = Div("pin " + RarityClass("pin", first.Type, first.Rarity));
+                pin.userData = label;
+                if (here.All(d => d.Mine)) pin.AddToClassList("mine");
+                if (first.Found != null) pin.AddToClassList("pin-event");
+                var words = Text(label, "pin-label strong one-line");
+                words.pickingMode = PickingMode.Ignore;
+                pin.Add(words);
                 var disc = Div("pin-disc");
                 disc.pickingMode = PickingMode.Ignore;
-                disc.Add(new Icon(Icon.For(drop.Type, drop.ObjectId), 22));
+                disc.Add(new Icon(Icon.For(first.Type, first.ObjectId), 22));
                 pin.Add(disc);
                 var tail = Div("pin-tail");
                 tail.pickingMode = PickingMode.Ignore;
                 pin.Add(tail);
-                var id = drop.Id;
-                pin.AddManipulator(new Clickable(() =>
+                if (count > 1)
                 {
-                    if (pins.TryGetValue(id, out var current)) SelectDrop(current.drop);
-                }));
+                    var badge = Text(count > 99 ? "99+" : count.ToString(), "pin-count");
+                    badge.pickingMode = PickingMode.Ignore;
+                    pin.Add(badge);
+                }
+                var spot = key;
+                pin.AddManipulator(new Clickable(() => OpenSpot(spot)));
                 pinLayer.Add(pin);
-                pins[drop.Id] = (pin, drop);
-            }
-            foreach (var id in pins.Keys.Where(k => !keep.Contains(k)).ToList())
-            {
-                pins[id].pin.RemoveFromHierarchy();
-                pins.Remove(id);
+                pins[key] = (pin, first);
             }
             MarkSelectedPin(selectedPin);
             Icon.Repaint(pinLayer);
+        }
+
+        void OpenSpot(string key)
+        {
+            if (!spots.TryGetValue(key, out var here) || here.Count == 0) return;
+            if (here.Count == 1) SelectDrop(here[0]);
+            else ShowSpot(key, here);
+        }
+
+        /// <summary>Everything at one spot, in a list to scroll: events soonest first. A row opens its card.</summary>
+        void ShowSpot(string key, List<DropInfo> here)
+        {
+            selectedDrop = null;
+            MarkSelectedPin(key);
+            Map.SetRoute(null);
+            panel = null;
+            SetNavSelected("map");
+            card.Clear();
+            card.style.display = DisplayStyle.Flex;
+
+            card.Add(Div("handle"));
+            var first = here[0];
+            var head = Div("spot-head");
+            head.Add(Text($"{here.Count} here", "chip chip-plain"));
+            head.Add(Text(PlaceName(first) == "Here" ? "Things at this spot" : PlaceName(first), "display"));
+            if (first.Found != null && !string.IsNullOrEmpty(first.Found.Address)) head.Add(Text(first.Found.Address, "muted mt-2"));
+            card.Add(head);
+            var close = Div("close-x");
+            close.Add(new Icon("close", 20));
+            close.AddManipulator(new Clickable(CloseCard));
+            card.Add(close);
+
+            var list = new ScrollView(ScrollViewMode.Vertical)
+            {
+                horizontalScrollerVisibility = ScrollerVisibility.Hidden,
+                verticalScrollerVisibility = ScrollerVisibility.Hidden,
+            };
+            list.AddToClassList("spot-list");
+            foreach (var drop in here.OrderBy(d => d.Found?.Start ?? "").ThenBy(d => d.Title))
+            {
+                var row = Div("spot-row");
+                row.Add(Thumb(drop.Type, drop.Rarity, drop.ObjectId));
+                var words = Div("near-text");
+                words.Add(drop.Found != null ? EventChip(drop.Found) : Chip(drop.Type, drop.Rarity));
+                words.Add(Text(drop.Title, "strong lead one-line"));
+                words.Add(Text(drop.Found != null ? Words.When(drop.Found) : drop.OwnerName, "muted small one-line mt-2"));
+                row.Add(words);
+                row.Add(new Icon("chevron", 18));
+                var chosen = drop;
+                row.AddManipulator(new Clickable(() => SelectDrop(chosen)));
+                list.Add(row);
+            }
+            card.Add(list);
+            Icon.Repaint(card);
+            UpdateChrome();
         }
 
         /// <summary>Moves each pin to its drop's spot on screen; nearer pins drawn on top.</summary>
@@ -503,10 +640,8 @@ namespace Hololoco
                 nearby = drops.Concat(loose).ToList();
                 nearbyQuests = result["quests"] as JArray ?? new JArray();
                 Map.SightRadius = (float?)result["radius"] ?? Map.SightRadius;
-                Map.ShowDrops(nearby);
                 if (result["player"] is JObject p) SetPlayer(p);
-                SyncPins();
-                RenderNearby();
+                ApplyFilter();
                 AlertIfNear();
             }
             catch (Exception e)
@@ -516,6 +651,112 @@ namespace Hololoco
             finally
             {
                 fetching = false;
+            }
+        }
+
+        /// <summary>Events and giveaways around town: a wider look than app_nearby, refreshed every few minutes.</summary>
+        async Task RefreshFound(double lat, double lng)
+        {
+            fetchingFound = true;
+            foundAt = Time.time;
+            try
+            {
+                var result = await Supabase.Rpc("app_found_nearby", new JObject { ["lat"] = lat, ["lng"] = lng, ["radius_m"] = 15000 });
+                foundLat = lat;
+                foundLng = lng;
+                aroundTown = (result as JArray ?? new JArray()).Select(DropInfo.From).ToList();
+                ApplyFilter();
+            }
+            catch (Exception)
+            {
+                // Keep what was there; the next refresh tries again.
+            }
+            finally
+            {
+                fetchingFound = false;
+            }
+        }
+
+        // ================================================================ map filters
+
+        void SetFilter(string id)
+        {
+            if (id == pinFilter) return;
+            pinFilter = id;
+            PlayerPrefs.SetString("hl.pins", id);
+            MarkFilter();
+            CloseCard();
+            ApplyFilter();
+        }
+
+        void MarkFilter()
+        {
+            foreach (var chip in filters.Children()) chip.EnableInClassList("selected", chip.name == pinFilter);
+        }
+
+        /// <summary>Everything worth a pin: what's in sight, plus events around town not already in it.</summary>
+        List<DropInfo> Everything()
+        {
+            var ids = new HashSet<string>(nearby.Select(d => d.Id));
+            return nearby.Concat(aroundTown.Where(d => !ids.Contains(d.Id))).ToList();
+        }
+
+        bool InReach(DropInfo d) => eventWithin <= 0f || Metres(d) <= eventWithin;
+
+        bool Passes(DropInfo d) => pinFilter switch
+        {
+            "events" => d.Found != null && InReach(d) && (eventType == null || d.Found.Category == eventType),
+            "business" => d.Found == null && !d.Loose && d.OwnerKind == "business",
+            "quests" => d.QuestName != null,
+            "mine" => d.Mine,
+            _ => true,
+        };
+
+        /// <summary>Pins, the map's drops and the cards along the bottom, for the chosen filter.</summary>
+        void ApplyFilter()
+        {
+            var everything = Everything();
+            var shown = everything.Where(Passes).ToList();
+            if (pinFilter == "events") RenderEventFilters(everything.Where(d => d.Found != null && InReach(d)).ToList());
+            Map.ShowDrops(shown);
+            SyncPins(shown);
+            RenderNearby(shown);
+        }
+
+        /// <summary>Distance (tap to change) and the kinds of event there are, with how many of each.</summary>
+        void RenderEventFilters(List<DropInfo> events)
+        {
+            eventFilters.Clear();
+            var distance = new Tap(eventWithin <= 0f ? "Any distance" : $"Within {eventWithin / 1000f:0} km", () =>
+            {
+                var at = Array.IndexOf(EventDistances, eventWithin);
+                eventWithin = EventDistances[(at + 1) % EventDistances.Length];
+                ApplyFilter();
+            });
+            distance.AddToClassList("filter");
+            distance.EnableInClassList("selected", eventWithin > 0f);
+            eventFilters.Add(distance);
+
+            var any = new Tap("Any type", () =>
+            {
+                eventType = null;
+                ApplyFilter();
+            });
+            any.AddToClassList("filter");
+            any.EnableInClassList("selected", eventType == null);
+            eventFilters.Add(any);
+
+            foreach (var kind in events.GroupBy(d => d.Found.Category).OrderByDescending(g => g.Count()))
+            {
+                var category = kind.Key;
+                var chip = new Tap($"{Words.Category(category)}  {kind.Count()}", () =>
+                {
+                    eventType = eventType == category ? null : category;
+                    ApplyFilter();
+                });
+                chip.AddToClassList("filter");
+                chip.EnableInClassList("selected", eventType == category);
+                eventFilters.Add(chip);
             }
         }
 
@@ -607,27 +848,58 @@ namespace Hololoco
 
         // ================================================================ nearby cards
 
-        void RenderNearby()
+        void RenderNearby(List<DropInfo> shown)
         {
             nearbyStrip.Clear();
-            var others = nearby.Where(d => !d.Mine).ToList();
-            foreach (var drop in others.OrderBy(Metres).Take(6))
+            // Your own drops only under Mine; elsewhere they're on the map but not in the cards.
+            var others = shown.Where(d => pinFilter == "mine" || !d.Mine).ToList();
+            // Events soonest first; everything else nearest first.
+            var ordered = pinFilter == "events"
+                ? others.OrderBy(d => d.Found?.Start ?? "").ThenBy(Metres)
+                : others.OrderBy(Metres);
+            foreach (var drop in ordered.Take(pinFilter == "events" ? 12 : 6))
             {
                 var c = Div("near-card");
                 c.Add(Thumb(drop.Type, drop.Rarity, drop.ObjectId));
                 var words = Div("near-text");
-                words.Add(Chip(drop.Type, drop.Rarity));
+                words.Add(drop.Found != null ? EventChip(drop.Found) : Chip(drop.Type, drop.Rarity));
                 words.Add(Text(drop.Title, "strong lead one-line"));
-                words.Add(Text($"{drop.OwnerName} · {Walk(Metres(drop))}", "muted small one-line mt-2"));
+                words.Add(Text(drop.Found != null
+                    ? $"{Words.When(drop.Found)} · {Words.Distance(Metres(drop))}"
+                    : $"{drop.OwnerName} · {Walk(Metres(drop))}", "muted small one-line mt-2"));
                 c.Add(words);
                 var chosen = drop;
                 c.AddManipulator(new Clickable(() => SelectDrop(chosen)));
                 nearbyStrip.Add(c);
             }
-            countPill.text = others.Count == 1 ? "1 thing nearby" : $"{others.Count} things nearby";
-            Show(countPill, others.Count > 0);
+            if (others.Count == 0 && pinFilter != "all")
+            {
+                var empty = Div("near-card near-empty");
+                empty.Add(Text(pinFilter switch
+                {
+                    "events" => "No events around here yet. Hololoco is finding events in Austin first.",
+                    "business" => "No business drops nearby yet.",
+                    "quests" => "No quests start near here yet.",
+                    _ => "Nothing of yours nearby. Tap + to leave a message.",
+                }, "muted"));
+                nearbyStrip.Add(empty);
+            }
+            // "All" counts what's in sight; the events around town have their own filter.
+            var count = pinFilter == "all" ? others.Count(d => d.Found == null || Metres(d) <= Map.SightRadius) : others.Count;
+            countPill.text = pinFilter switch
+            {
+                "events" => count == 1 ? "1 event around town" : $"{count} events around town",
+                "business" => count == 1 ? "1 business drop" : $"{count} business drops",
+                "quests" => count == 1 ? "1 quest stop" : $"{count} quest stops",
+                "mine" => count == 1 ? "1 of yours" : $"{count} of yours",
+                _ => count == 1 ? "1 thing nearby" : $"{count} things nearby",
+            };
+            Show(countPill, count > 0);
             UpdateChrome();
         }
+
+        static Label EventChip(FoundInfo found) =>
+            Text(found.Free ? $"{Words.Category(found.Category)} · Free" : Words.Category(found.Category), "chip chip-warm");
 
         // ================================================================ near-a-drop alerts
 
@@ -665,7 +937,8 @@ namespace Hololoco
         void SelectDrop(DropInfo drop)
         {
             selectedDrop = drop;
-            MarkSelectedPin(drop.Id);
+            var spotKey = SpotKey(drop);
+            MarkSelectedPin(spotKey);
             Map.SetRoute(null);
             panel = null;
             SetNavSelected("map");
@@ -673,12 +946,15 @@ namespace Hololoco
             card.style.display = DisplayStyle.Flex;
 
             card.Add(Div("handle"));
+            // From a shared pin: the way back to everything there.
+            if (spots.TryGetValue(spotKey, out var neighbours) && neighbours.Count > 1)
+                card.Add(Action($"‹ All {neighbours.Count} at {PlaceName(neighbours[0])}", () => ShowSpot(spotKey, neighbours), "link back-link"));
             var head = Div("row");
             head.Add(Thumb(drop.Type, drop.Rarity, drop.ObjectId, true));
             var info = Div("head-text");
-            info.Add(Chip(drop.Type, drop.Rarity));
+            info.Add(drop.Found != null ? EventChip(drop.Found) : Chip(drop.Type, drop.Rarity));
             info.Add(Text(drop.Title, "display"));
-            info.Add(Text(drop.OwnerName, "muted mt-2"));
+            info.Add(Text(drop.Found != null ? drop.Found.Venue : drop.OwnerName, "muted mt-2"));
             head.Add(info);
             card.Add(head);
             var close = Div("close-x");
@@ -687,6 +963,14 @@ namespace Hololoco
             card.Add(close);
 
             if (drop.Savings != null) card.Add(Text(drop.Savings, "strong lead mt-16"));
+            if (drop.Found != null)
+            {
+                var when = Words.When(drop.Found);
+                if (!string.IsNullOrEmpty(drop.Found.TimeNote)) when += $"\n{drop.Found.TimeNote}";
+                card.Add(Notice("calendar", when, "accent"));
+                var where = string.IsNullOrEmpty(drop.Found.Price) ? drop.Found.Address : $"{drop.Found.Address}\n{drop.Found.Price}";
+                if (!string.IsNullOrEmpty(where)) card.Add(Text(where, "muted mt-8"));
+            }
             if (!string.IsNullOrEmpty(drop.Description)) card.Add(Text(drop.Description, "muted mt-8"));
 
             var stats = Div("stats");
@@ -736,6 +1020,11 @@ namespace Hololoco
                 buttons.Add(Action("Walk there", () => _ = WalkTo(drop), "primary"));
                 buttons.Add(Text("Get within about 40 m to open it in AR.", "muted small center mt-8"));
             }
+            // An event's own page, and where to get tickets, open in the browser.
+            var page = drop.Found?.Url;
+            var tickets = drop.Found?.TicketUrl;
+            if (page != null) buttons.Add(Action("Event page", () => Application.OpenURL(page), "secondary"));
+            if (tickets != null && tickets != page) buttons.Add(Action("Tickets", () => Application.OpenURL(tickets), "secondary"));
         }
 
         async Task WalkTo(DropInfo drop)

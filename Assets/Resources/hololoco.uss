@@ -85,6 +85,26 @@
 
 .top-spacer { flex-grow: 1; }
 
+/* Which pins the map shows: All, Events, Businesses, Quests, Mine. Leaves room for the tools on the right. */
+.filters { position: absolute; top: 94px; left: 16px; right: 74px; height: 44px; }
+.filters .unity-scroll-view__content-container { flex-direction: row; }
+.filter {
+    margin: 0 8px 0 0;
+    padding: 0 15px;
+    height: 40px;
+    border-radius: 20px;
+    background-color: var(--float);
+    border-width: 1px;
+    border-color: var(--float-line);
+    color: var(--ink);
+    font-size: 14px;
+    -unity-font-style: bold;
+    -unity-text-align: middle-center;
+}
+.filter.selected { background-color: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+
+.near-empty { justify-content: center; padding: 12px 16px; }
+
 .round {
     width: 48px;
     height: 48px;
@@ -107,7 +127,7 @@
 
 .status {
     position: absolute;
-    top: 94px;
+    top: 146px;
     left: 16px;
     max-width: 66%;
     padding: 9px 14px;
@@ -122,7 +142,7 @@
 
 .banner {
     position: absolute;
-    top: 94px;
+    top: 146px;
     left: 16px;
     right: 76px;
     flex-direction: row;
@@ -694,3 +714,42 @@ TextField.multiline > .unity-base-text-field__input { min-height: 100px; padding
 }
 
 .code { font-size: 50px; letter-spacing: 6px; -unity-text-align: middle-center; margin: 16px 0 8px 0; color: var(--accent); }
+
+/* Events and giveaways around town get a warm ring, so they read apart from drops. */
+.pin-event .pin-disc { border-color: var(--warm); }
+
+
+/* Under Events: distance and kind of event. Status and alerts move down to make room. */
+.subfilters { top: 142px; }
+.with-subfilters .status, .with-subfilters .banner { top: 194px; }
+
+/* A pin several things share: how many, on its corner. */
+.pin-count {
+    position: absolute;
+    top: 0;
+    right: -4px;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 6px;
+    border-radius: 11px;
+    border-width: 2px;
+    border-color: var(--pin-bg);
+    background-color: var(--accent);
+    color: var(--on-accent);
+    font-size: 12px;
+    -unity-font-style: bold;
+    -unity-text-align: middle-center;
+}
+
+/* Everything at one spot, in the card sheet. */
+.spot-head { margin-right: 44px; }
+.spot-list { max-height: 440px; margin-top: 10px; }
+.spot-row {
+    flex-direction: row;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom-width: 1px;
+    border-color: var(--line);
+}
+.spot-row > .icon { color: var(--muted); flex-shrink: 0; }
+.back-link { align-self: flex-start; margin: -6px 0 6px -8px; }
