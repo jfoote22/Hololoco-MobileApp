@@ -259,6 +259,10 @@ public static class HololocoSetup
         // AR: the session (off until a drop is opened) and the camera rig.
         var session = new GameObject("AR Session").AddComponent<ARSession>();
         session.enabled = false;
+        // The input manager starts AR's input subsystem, which is what feeds the phone's
+        // tracked pose to the camera's TrackedPoseDriver. Without it the AR camera never
+        // moves, so anything placed in the world looks stuck to the screen.
+        session.gameObject.AddComponent<ARInputManager>();
         var originObject = new GameObject("XR Origin");
 #pragma warning disable CS0618 // ARCore Extensions still asks for an ARSessionOrigin (an XROrigin).
         var origin = originObject.AddComponent<ARSessionOrigin>();
@@ -281,12 +285,13 @@ public static class HololocoSetup
         pose.rotationInput = new InputActionProperty(new InputAction("Rotation", binding: "<HandheldARInputDevice>/deviceRotation"));
         origin.Camera = arCamera;
         origin.CameraFloorOffsetObject = offset;
-        // Ground finding for encounters: horizontal planes, raycasts into them, and anchors
-        // that keep a drop locked to its spot.
+        // XR Origin lifts the camera by a default standing height (1.1176 m) in device
+        // tracking mode, which phone AR reports. The planes ARCore finds aren't lifted, so
+        // the floor would sit a metre below where the camera thinks it is. No lift.
+        origin.CameraYOffset = 0f;
+        // Floor finding for encounters: the drop stands on the lowest horizontal plane.
         var planes = originObject.AddComponent<ARPlaneManager>();
         planes.requestedDetectionMode = UnityEngine.XR.ARSubsystems.PlaneDetectionMode.Horizontal;
-        var raycasts = originObject.AddComponent<ARRaycastManager>();
-        originObject.AddComponent<ARAnchorManager>();
         // No ARCore Extensions (Geospatial) in the scene: encounters appear in front of the
         // player, and ARCore Extensions crashes when the AR session starts switched off.
         // The precise "explore" mode (Scripts/Later) will bring it back, enabled with the session.
@@ -308,7 +313,6 @@ public static class HololocoSetup
         var encounter = new GameObject("Encounter").AddComponent<Encounter>();
         encounter.Camera = arCamera;
         encounter.Session = session;
-        encounter.Raycasts = raycasts;
         encounter.Planes = planes;
 
         var preview = new GameObject("Preview").AddComponent<Preview>();
@@ -317,6 +321,7 @@ public static class HololocoSetup
         var document = appObject.AddComponent<UIDocument>();
         document.panelSettings = panel;
         var location = appObject.AddComponent<Location>();
+        encounter.Location = location;
         var app = appObject.AddComponent<App>();
         app.Document = document;
         app.Location = location;

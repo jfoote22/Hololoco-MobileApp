@@ -6,8 +6,10 @@
 //               "Open in AR" when you're close, or "Walk there".
 //   Quests      the quest you're on, stop by stop, and quests starting nearby.
 //   Scan        opens AR on the closest drop you can reach.
-//   AR          the app finds the ground a few steps ahead and anchors the item's own
-//               3D model there, locked to the spot. Capture it or leave it. Take a photo.
+//   AR          the item's own 3D model, standing on the ground and staying put while
+//               you walk around it: from the map, at its spot on the map (GPS and
+//               compass); from the bag, right in front of you. A chip says which way
+//               it is. Capture it (or pick up an item someone left), leave it, take a photo.
 //   Bag         what you've collected: Redeem (a code for the counter), View in AR,
 //               Leave it here (for someone else), Throw away.
 //   Me          level and XP, the Look (skin), settings, your trading name, sign out.
@@ -41,6 +43,7 @@ namespace Hololoco
 
         enum Mode { Map, Encounter, ViewItem }
         Mode mode = Mode.Map;
+        float arSince;
         string panel; // null (just the map), "quests", "bag", "me" or "drop"
 
         VisualElement root, pinLayer, top, tools, nav, page, card, arUi, banner, levelFill;
@@ -210,6 +213,7 @@ namespace Hololoco
             root.Add(card);
 
             arUi = Div("ar");
+            arUi.pickingMode = PickingMode.Ignore;
             arUi.style.display = DisplayStyle.None;
             root.Add(arUi);
 
@@ -233,8 +237,9 @@ namespace Hololoco
 
         void SetMode(Mode next)
         {
-            mode = next;
             var ar = next != Mode.Map;
+            if (ar && mode == Mode.Map) arSince = Time.time;
+            mode = next;
             Session.enabled = ar;
             ArCamera.enabled = ar;
             MapCamera.enabled = !ar;
@@ -369,20 +374,45 @@ namespace Hololoco
 
             if (mode == Mode.Map && card.style.display == DisplayStyle.Flex && selectedDrop != null) RenderCardDistance();
             if (mode == Mode.Map && panel == null) PlacePins();
-            if (mode != Mode.Map && arChipWords != null && Encounter.Locked && arChipWords.text != "Locked to this spot")
-                arChipWords.text = "Locked to this spot";
+            if (mode != Mode.Map) UpdateAr();
             HandleArTap();
         }
 
-        /// <summary>In AR, tapping the item captures it too.</summary>
+        /// <summary>In AR, tapping the item captures it (or picks it up), the same as the button.</summary>
         void HandleArTap()
         {
-            if (mode != Mode.Encounter || Encounter.Searching || Input.touchCount != 1) return;
+            if (mode != Mode.Encounter || Time.time - arSince < 0.5f || Input.touchCount != 1) return;
             var touch = Input.GetTouch(0);
             if (touch.phase != TouchPhase.Ended || OverUi(touch.position)) return;
-            if (Physics.Raycast(ArCamera.ScreenPointToRay(touch.position), out var hit, 20f, ~(1 << MapView.Layer | 1 << Preview.Layer))
-                && Encounter.IsPart(hit.collider))
-                _ = CaptureInAr();
+            if (Physics.Raycast(ArCamera.ScreenPointToRay(touch.position), out var hit, 40f, ~(1 << MapView.Layer | 1 << Preview.Layer))
+                && Encounter.IsPart(hit.collider) && CanTake(encounterDrop))
+                _ = TakeInAr();
+        }
+
+        float arWordsAt;
+
+        void UpdateAr()
+        {
+            if (Time.time - arWordsAt < 0.25f) return;
+            arWordsAt = Time.time;
+            if (Encounter.Finding && findingWords != null) findingWords.text = Encounter.FindingWords;
+            if (arChipWords != null && Encounter.Position != null) arChipWords.text = WhichWay();
+        }
+
+        /// <summary>Where the item is from here: "Right here", "12 m ahead", "To your left · 12 m"…</summary>
+        string WhichWay()
+        {
+            var at = Encounter.Position;
+            if (at == null) return "";
+            var cam = ArCamera.transform;
+            var to = Vector3.ProjectOnPlane(at.Value - cam.position, Vector3.up);
+            var metres = to.magnitude;
+            var ahead = Vector3.ProjectOnPlane(cam.forward, Vector3.up);
+            var angle = ahead.sqrMagnitude > 0.001f ? Vector3.SignedAngle(ahead, to, Vector3.up) : 0f;
+            var far = Words.Distance(metres);
+            if (Mathf.Abs(angle) <= 30f) return metres < 4f ? "Right here" : $"{far} ahead";
+            if (Mathf.Abs(angle) >= 140f) return $"Behind you · {far}";
+            return angle > 0 ? $"To your right · {far}" : $"To your left · {far}";
         }
 
         // ================================================================ pins on the map
@@ -468,7 +498,9 @@ namespace Hololoco
                 var result = await Supabase.Rpc("app_nearby", new JObject { ["lat"] = lat, ["lng"] = lng, ["radius_m"] = 1500 });
                 lastLat = lat;
                 lastLng = lng;
-                nearby = ((JArray)result["drops"]).Select(DropInfo.From).ToList();
+                var drops = ((JArray)result["drops"]).Select(DropInfo.From);
+                var loose = (result["items"] as JArray ?? new JArray()).Select(LooseOrNull).Where(d => d != null);
+                nearby = drops.Concat(loose).ToList();
                 nearbyQuests = result["quests"] as JArray ?? new JArray();
                 Map.SightRadius = (float?)result["radius"] ?? Map.SightRadius;
                 Map.ShowDrops(nearby);
@@ -484,6 +516,18 @@ namespace Hololoco
             finally
             {
                 fetching = false;
+            }
+        }
+
+        static DropInfo LooseOrNull(JToken j)
+        {
+            try
+            {
+                return DropInfo.FromLoose(j);
+            }
+            catch (Exception)
+            {
+                return null;
             }
         }
 
@@ -667,7 +711,7 @@ namespace Hololoco
         void RenderCardDistance(bool force = false)
         {
             var drop = selectedDrop;
-            var close = CloseEnough(drop) && !drop.Mine && !(drop.Captured && drop.QuestName == null);
+            var close = CloseEnough(drop);
             if (Location.HasFix)
             {
                 var metres = DistanceTo(drop);
@@ -683,9 +727,10 @@ namespace Hololoco
             lastClose = close;
             var buttons = card.Q("buttons");
             buttons.Clear();
-            if (drop.Mine) buttons.Add(Text("This one is yours.", "muted mt-12"));
+            if (drop.Loose) buttons.Add(Text(drop.Mine ? "You left this here. Pick it back up any time." : "Someone left this here for anyone to pick up.", "muted mt-12"));
+            else if (drop.Mine) buttons.Add(Text("This one is yours.", "muted mt-12"));
             else if (drop.Captured && drop.QuestName == null) buttons.Add(Text("You've collected this one.", "muted mt-12"));
-            else if (close) buttons.Add(Action("Open in AR", () => OpenInAr(drop), drop.Rarity == "rare" ? "rare" : "primary"));
+            if (close) buttons.Add(Action(CanTake(drop) ? "Open in AR" : "See it in AR", () => OpenInAr(drop), drop.Rarity == "rare" ? "rare" : "primary"));
             else
             {
                 buttons.Add(Action("Walk there", () => _ = WalkTo(drop), "primary"));
@@ -738,18 +783,21 @@ namespace Hololoco
 
         IEnumerator ShowEncounter(DropInfo drop)
         {
-            yield return Encounter.Show(drop);
+            // A first find goes at its spot on the map; one that's yours or already collected
+            // goes right in front of you, like the bag's View in AR.
+            yield return Encounter.Show(drop, CanTake(drop));
             if (mode == Mode.Encounter && encounterDrop == drop) RenderArChoice();
         }
 
-        /// <summary>The chip at the top of AR: locked to a surface, or standing in front of the player.</summary>
-        (string icon, string words) PlacedChip() => Encounter.Locked ? ("pin", "Locked to this spot") : ("pin", "Standing in front of you");
+        /// <summary>Whether this drop can go in your bag from AR: a capture, or picking up a left item.</summary>
+        static bool CanTake(DropInfo d) => d != null && (d.Loose || (!d.Mine && !(d.Captured && d.QuestName == null)));
 
         Label arChipWords;
 
         VisualElement ArTop(Action close, string chipIcon = null, string chipText = null)
         {
             var row = Div("ar-top");
+            row.pickingMode = PickingMode.Ignore;
             row.Add(Round("close", close));
             arChipWords = null;
             if (chipText != null)
@@ -763,38 +811,89 @@ namespace Hololoco
             return row;
         }
 
+        Label findingWords;
+
+        /// <summary>The moment before it appears: AR tracking, the floor and the compass.</summary>
         void RenderArLooking()
         {
             arUi.Clear();
             arUi.Add(ArTop(() => SetMode(Mode.Map)));
             var hint = Div("ar-hint");
-            hint.Add(new Icon("scan", 44));
-            hint.Add(Text("Point your phone at the ground a few steps away", "strong center mt-12"));
-            hint.Add(Text("Move it slowly so your phone can find the floor.", "muted small center mt-4"));
+            hint.pickingMode = PickingMode.Ignore;
+            hint.Add(new Icon("scan", 40));
+            findingWords = Text("Starting the camera…", "strong center mt-12");
+            findingWords.pickingMode = PickingMode.Ignore;
+            hint.Add(findingWords);
+            var help = Text("It'll appear in a moment and stay right there while you walk around it.", "muted small center mt-4");
+            help.pickingMode = PickingMode.Ignore;
+            hint.Add(help);
             arUi.Add(hint);
-            arUi.Add(Div());
+            arUi.Add(Spacer());
         }
 
         void RenderArChoice()
         {
             arUi.Clear();
             var drop = encounterDrop;
-            var (chipIcon, chipWords) = PlacedChip();
-            arUi.Add(ArTop(() => StartCoroutine(LeaveInAr()), chipIcon, chipWords));
-            arUi.Add(Div());
+            findingWords = null;
+            var take = CanTake(drop);
+            arUi.Add(ArTop(() => { if (take) StartCoroutine(LeaveInAr()); else SetMode(Mode.Map); }, "pin", WhichWay()));
+            arUi.Add(Spacer());
             var box = Div("ar-card");
             box.Add(Chip(drop.Type, drop.Rarity));
             box.Add(Text(drop.Title, "display"));
             box.Add(Text(drop.Savings ?? drop.OwnerName, "muted mt-4"));
-            box.Add(Text(Encounter.Locked ? "It stays right there. Walk around it, then tap it or Capture." : "Tap it or Capture when you're ready.", "muted small mt-8"));
+            var verb = drop.Loose ? "Pick it up" : "Capture";
+            box.Add(Text(take ? $"It stays right there. Walk up to it, then tap it or {verb}."
+                : drop.Mine ? "This one is yours. It stays right there; walk around it."
+                : "You've collected this one. It stays right there; walk around it.", "muted small mt-8"));
             var buttons = Div("buttons");
-            buttons.Add(Action("Leave it", () => StartCoroutine(LeaveInAr()), "secondary"));
-            buttons.Add(Action("Capture", () => _ = CaptureInAr(), drop.Rarity == "rare" ? "rare" : "primary"));
+            if (take)
+            {
+                buttons.Add(Action("Leave it", () => StartCoroutine(LeaveInAr()), "secondary"));
+                buttons.Add(Action(verb, () => _ = TakeInAr(), drop.Rarity == "rare" ? "rare" : "primary"));
+            }
+            else
+            {
+                buttons.Add(Action("Photo", TakePhoto, "secondary"));
+                buttons.Add(Action("Done", () => SetMode(Mode.Map), "primary"));
+            }
             box.Add(buttons);
             arUi.Add(box);
         }
 
         bool capturing;
+
+        Task TakeInAr() => encounterDrop?.Loose == true ? PickUpInAr() : CaptureInAr();
+
+        /// <summary>Picks up an item left on the map (someone else's, or your own back).</summary>
+        async Task PickUpInAr()
+        {
+            if (capturing || encounterDrop?.ItemId == null) return;
+            capturing = true;
+            var drop = encounterDrop;
+            try
+            {
+                var result = await Supabase.Rpc("pick_up_item", new JObject
+                {
+                    ["item_id"] = drop.ItemId, ["lat"] = Location.Lat, ["lng"] = Location.Lng,
+                    ["accuracy_m"] = Mathf.Max(Location.Accuracy, 1f),
+                });
+                if (result["player"] is JObject p) SetPlayer(p);
+                arUi.Clear();
+                StartCoroutine(AfterCapture(drop, result));
+                lastFetch = -999f;
+            }
+            catch (Exception e)
+            {
+                ShowToast(Words.For(e));
+            }
+            finally
+            {
+                capturing = false;
+            }
+        }
+
         async Task CaptureInAr()
         {
             if (capturing || encounterDrop == null) return;
@@ -827,11 +926,12 @@ namespace Hololoco
             yield return Encounter.Captured(drop.Json);
             arUi.Clear();
             arUi.Add(ArTop(() => SetMode(Mode.Map)));
-            arUi.Add(Div());
+            arUi.Add(Spacer());
             var box = Div("ar-card");
             var kept = result["item"]?.Type == JTokenType.Object;
-            box.Add(Text(kept ? "Added to your bag" : "Collected", "strong accent"));
-            box.Add(Text($"+{(int?)result["xp"] ?? 0} XP", drop.Rarity == "rare" ? "big rare-ink" : "big"));
+            var xp = (int?)result["xp"] ?? 0;
+            box.Add(Text(drop.Loose && drop.Mine ? "Back in your bag" : kept ? "Added to your bag" : "Collected", "strong accent"));
+            if (xp > 0) box.Add(Text($"+{xp} XP", drop.Rarity == "rare" ? "big rare-ink" : "big"));
             box.Add(Text(drop.Title, "display"));
             if (result["quest"] is JObject q)
                 box.Add(Notice("quests", (bool?)q["completed"] == true
@@ -866,9 +966,9 @@ namespace Hololoco
             yield return Encounter.ShowItem(item["drop"]);
             if (mode != Mode.ViewItem) yield break;
             arUi.Clear();
-            var (chipIcon, chipWords) = PlacedChip();
-            arUi.Add(ArTop(() => SetMode(Mode.Map), chipIcon, chipWords));
-            arUi.Add(Div());
+            findingWords = null;
+            arUi.Add(ArTop(() => SetMode(Mode.Map), "pin", WhichWay()));
+            arUi.Add(Spacer());
             var box = Div("ar-card");
             box.Add(Text((string)item["title"], "display"));
             box.Add(Text("Walk around it and take a photo.", "muted mt-4"));
@@ -1159,7 +1259,11 @@ namespace Hololoco
                 if ((bool?)item["tradeable"] ?? true) actions.Add(Action("Leave it here for someone", () => { Close(); _ = LeaveHere(item); }, "secondary"));
                 actions.Add(Action("Throw away", () => { Close(); Confirm($"Throw away {(string)item["title"]}?", () => _ = ThrowAway(item)); }, "danger"));
             }
-            else box.Add(Text(status == "redeemed" ? "Redeemed." : "Left on the map for someone else.", "muted mt-12"));
+            else
+            {
+                box.Add(Text(status == "redeemed" ? "Redeemed." : "Left on the map. Go back to it to pick it up again.", "muted mt-12"));
+                actions.Add(Action("View in AR", () => { Close(); ViewItemInAr(item); }, "secondary"));
+            }
             actions.Add(Action("Close", Close, "link"));
             box.Add(actions);
         }
@@ -1581,6 +1685,14 @@ namespace Hololoco
                 if (onClick != null) clicked += onClick;
                 this.AddManipulator(new Clickable(() => clicked?.Invoke()));
             }
+        }
+
+        /// <summary>Empty room in the AR layout that lets taps through to AR.</summary>
+        static VisualElement Spacer()
+        {
+            var e = new VisualElement { pickingMode = PickingMode.Ignore };
+            e.style.flexGrow = 1;
+            return e;
         }
 
         static VisualElement Div(string classes = null)

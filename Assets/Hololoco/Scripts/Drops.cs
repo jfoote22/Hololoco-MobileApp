@@ -21,6 +21,33 @@ namespace Hololoco
         public string QuestName;
         public int QuestStage, QuestStages;
         public JToken Json;
+        /// <summary>For an item someone left on the map (app_nearby's items): its inventory id. Null for a drop.</summary>
+        public string ItemId;
+        public bool Loose => ItemId != null;
+
+        /// <summary>
+        /// An item left on the map, from app_nearby's items: the drop it came from, at the
+        /// spot it was left. Mine means you left it (and can take it back).
+        /// </summary>
+        public static DropInfo FromLoose(JToken j)
+        {
+            var snapshot = j["drop"] as JObject ?? new JObject();
+            var d = From(snapshot);
+            var p = j["placement"];
+            d.ItemId = (string)j["id"];
+            d.Id = "item:" + d.ItemId;
+            d.Title = (string)j["title"] ?? d.Title ?? "Something";
+            d.Type ??= (string)j["kind"] ?? "object";
+            d.Rarity = (string)j["rarity"] ?? d.Rarity;
+            d.Lat = (double)p["lat"];
+            d.Lng = (double)p["lng"];
+            d.Height = 0;
+            d.Distance = (float?)j["distance"] ?? 0;
+            d.Mine = (bool?)j["mine"] ?? false;
+            d.Captured = false;
+            d.QuestName = null;
+            return d;
+        }
 
         public static DropInfo From(JToken j)
         {
@@ -38,11 +65,11 @@ namespace Hololoco
                 ObjectId = (string)j["objectId"],
                 AssetModel = (string)j["asset"].At("model"),
                 AssetKind = (string)j["asset"].At("kind"),
-                Lat = (double)p["lat"],
-                Lng = (double)p["lng"],
-                Height = (float?)p["height"] ?? 0,
-                Size = (float?)p["size"] ?? 4,
-                Turn = (float?)p["turn"] ?? 0,
+                Lat = (double?)p.At("lat") ?? 0,
+                Lng = (double?)p.At("lng") ?? 0,
+                Height = (float?)p.At("height") ?? 0,
+                Size = (float?)p.At("size") ?? 4,
+                Turn = (float?)p.At("turn") ?? 0,
                 Distance = (float?)j["distance"] ?? 0,
                 Captured = (bool?)j["captured"] ?? false,
                 Mine = (bool?)j["mine"] ?? false,
